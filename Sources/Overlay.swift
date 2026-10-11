@@ -40,6 +40,7 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         case none, draw
         case resize(anchor: NSPoint, hx: Bool, hy: Bool, orig: NSRect)
         case move(dx: CGFloat, dy: CGFloat)
+        case text(index: Int, start: NSPoint, last: NSPoint)
     }
 
     let image: CGImage
@@ -55,6 +56,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     private var width: CGFloat = 3
     private var scrollAcc: CGFloat = 0
     private var field: NSTextField?
+    private var fieldOriginal = ""
+    private var preview: NSPoint? { didSet { needsDisplay = true } }
     private let bar = NSStackView()
     private var toolButtons: [NSButton] = []
     private var colorButton: NSButton!
@@ -195,7 +198,9 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     // MARK: Mouse
 
     override func mouseDown(with e: NSEvent) {
+        let wasEditing = field != nil
         commitText()
+        preview = nil
         let p = convert(e.locationInWindow, from: nil)
         if let s = sel {
             if let h = handle(at: p, in: s) {
@@ -205,7 +210,9 @@ final class OverlayView: NSView, NSTextFieldDelegate {
             }
             if s.contains(p) {
                 if tool == .text {
-                    beginText(at: p)
+                    // Drag moves an existing text. A click without movement edits it (see mouseUp).
+                    // A click away from a text in edit only completes that text.
+                    if let i = textIndex(at: p) { drag = .text(index: i, start: p, last: p) } else if !wasEditing { beginText(at: p) }
                 } else if let t = tool {
                     current = Annotation(tool: t, color: color, width: width, points: [p, p])
                     drag = .draw
@@ -240,6 +247,10 @@ final class OverlayView: NSView, NSTextFieldDelegate {
             r.origin.x = max(0, min(p.x - dx, bounds.width - r.width)).rounded()
             r.origin.y = max(0, min(p.y - dy, bounds.height - r.height)).rounded()
             sel = r
+        case let .text(i, start, last):
+            annotations[i].points[0].x += p.x - last.x
+            annotations[i].points[0].y += p.y - last.y
+            drag = .text(index: i, start: start, last: p)
         case .draw:
             guard var a = current else { break }
             if a.tool == .pen || a.tool == .marker {
@@ -259,19 +270,39 @@ final class OverlayView: NSView, NSTextFieldDelegate {
             current = nil
         }
         if let s = sel, s.width < 2 || s.height < 2 { sel = nil }
+        if case let .text(i, start, last) = drag, hypot(last.x - start.x, last.y - start.y) < 3 {
+            beginText(at: start, editing: annotations.remove(at: i))
+        }
         drag = .none
         layoutBar()
     }
 
     override func scrollWheel(with e: NSEvent) {
-        guard field == nil else { return }
         scrollAcc += e.scrollingDeltaY
-        let step: CGFloat = e.hasPreciseScrollingDeltas ? 12 : 1
-        guard abs(scrollAcc) >= step else { return }
-        width = max(1, min(width + (scrollAcc > 0 ? 1 : -1), 20))
+        guard abs(scrollAcc) >= (e.hasPreciseScrollingDeltas ? 12 : 1) else { return }
+        let d: CGFloat = scrollAcc > 0 ? 1 : -1
         scrollAcc = 0
+        let p = convert(e.locationInWindow, from: nil)
+        // Text tool, pointer on an existing text: change the size of that text only.
+        if field == nil, tool == .text, let i = textIndex(at: p) {
+            annotations[i].width = max(1, min(annotations[i].width + d, 20))
+            return
+        }
+        width = max(1, min(width + d, 20))
+        if let f = field {
+            f.font = font(width)
+            (f.currentEditor() as? NSTextView)?.font = font(width)
+            let h = f.fittingSize.height
+            f.frame = NSRect(x: f.frame.minX, y: f.frame.midY - h / 2, width: f.frame.width, height: h)
+        } else {
+            preview = p
+            NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(hidePreview), object: nil)
+            perform(#selector(hidePreview), with: nil, afterDelay: 0.8)
+        }
         needsDisplay = true
     }
+
+    @objc private func hidePreview() { preview = nil }
 
     func clearSelection() {
         commitText()
@@ -311,27 +342,38 @@ final class OverlayView: NSView, NSTextFieldDelegate {
     private func font(_ width: CGFloat) -> NSFont { .boldSystemFont(ofSize: 10 + width * 2) }
 
     // ponytail: single-line text, Return commits. Use an NSTextView if multi-line text becomes necessary.
-    private func beginText(at p: NSPoint) {
+    private func beginText(at p: NSPoint, editing a: Annotation? = nil) {
         guard let s = sel else { return }
-        let f = NSTextField(string: "")
+        if let a { width = a.width }
+        let f = NSTextField(string: a?.text ?? "")
+        fieldOriginal = f.stringValue
         f.isBordered = false
         f.drawsBackground = false
         f.focusRingType = .none
         f.font = font(width)
-        f.textColor = color
+        f.textColor = a?.color ?? color
         f.delegate = self
         let h = f.fittingSize.height
-        f.frame = NSRect(x: p.x, y: p.y - h / 2, width: max(40, s.maxX - p.x), height: h)
+        // 2 pt = the horizontal text inset of NSTextField.
+        let o = a.map { NSPoint(x: $0.points[0].x - 2, y: $0.points[0].y) } ?? NSPoint(x: p.x, y: p.y - h / 2)
+        f.frame = NSRect(x: o.x, y: o.y, width: max(40, s.maxX - o.x), height: h)
         addSubview(f)
         window?.makeFirstResponder(f)
         field = f
+    }
+
+    private func textRect(_ a: Annotation) -> NSRect {
+        NSRect(origin: a.points[0], size: (a.text as NSString).size(withAttributes: [.font: font(a.width)]))
+    }
+
+    private func textIndex(at p: NSPoint) -> Int? {
+        annotations.lastIndex { $0.tool == .text && textRect($0).contains(p) }
     }
 
     private func commitText() {
         guard let f = field else { return }
         field = nil
         if !f.stringValue.isEmpty {
-            // 2 pt = the horizontal text inset of NSTextField.
             annotations.append(Annotation(tool: .text, color: f.textColor ?? color, width: width,
                                           points: [NSPoint(x: f.frame.minX + 2, y: f.frame.minY)], text: f.stringValue))
         }
@@ -341,7 +383,7 @@ final class OverlayView: NSView, NSTextFieldDelegate {
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
         if selector == #selector(insertNewline(_:)) { commitText(); return true }
-        if selector == #selector(cancelOperation(_:)) { field?.stringValue = ""; commitText(); return true }
+        if selector == #selector(cancelOperation(_:)) { field?.stringValue = fieldOriginal; commitText(); return true }
         return false
     }
 
@@ -359,6 +401,8 @@ final class OverlayView: NSView, NSTextFieldDelegate {
         guard let s = sel else { return }
         drawAnnotations(clip: s)
 
+        if let p = preview { drawPreview(at: p) }
+
         NSColor.white.setStroke()
         NSBezierPath(rect: s.insetBy(dx: -0.5, dy: -0.5)).stroke()
         for h in handlePoints(s) {
@@ -374,6 +418,22 @@ final class OverlayView: NSView, NSTextFieldDelegate {
                                                     .backgroundColor: NSColor(white: 0, alpha: 0.7)]
         let h = label.size(withAttributes: attrs).height
         label.draw(at: NSPoint(x: s.minX, y: s.maxY + h + 4 > bounds.maxY ? s.maxY - h - 4 : s.maxY + 4), withAttributes: attrs)
+    }
+
+    /// The size of the next line or text, at the pointer. Not part of the output image.
+    private func drawPreview(at p: NSPoint) {
+        if tool == .text {
+            let attrs: [NSAttributedString.Key: Any] = [.font: font(width), .foregroundColor: color]
+            let size = ("Aa" as NSString).size(withAttributes: attrs)
+            ("Aa" as NSString).draw(at: NSPoint(x: p.x - size.width / 2, y: p.y - size.height / 2), withAttributes: attrs)
+            return
+        }
+        let d = tool == .marker ? width * 5 : width
+        let dot = NSBezierPath(ovalIn: NSRect(x: p.x - d / 2, y: p.y - d / 2, width: d, height: d))
+        (tool == .marker ? color.withAlphaComponent(0.4) : color).setFill()
+        dot.fill()
+        NSColor.white.setStroke()
+        NSBezierPath(ovalIn: dot.bounds.insetBy(dx: -1.5, dy: -1.5)).stroke()
     }
 
     private func drawAnnotations(clip s: NSRect) {

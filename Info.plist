@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.makinoatorie.makishot</string>
+	<string>com.makinoatorie.justcap</string>
 	<key>CFBundleName</key>
-	<string>Makishot</string>
+	<string>justcap</string>
 	<key>CFBundleExecutable</key>
-	<string>Makishot</string>
+	<string>justcap</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

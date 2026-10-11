@@ -15,13 +15,13 @@ final class App: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "Makishot")
+        item.button?.image = NSImage(systemSymbolName: "camera.viewfinder", accessibilityDescription: "justcap")
         let menu = NSMenu()
         menu.addItem(withTitle: "Capture  ⇧⌘9", action: #selector(capture), keyEquivalent: "")
         let login = menu.addItem(withTitle: "Launch at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit Makishot", action: #selector(NSApplication.terminate), keyEquivalent: "q")
+        menu.addItem(withTitle: "Quit justcap", action: #selector(NSApplication.terminate), keyEquivalent: "q")
         item.menu = menu
 
         // Carbon hotkeys need no Accessibility permission.
@@ -110,7 +110,7 @@ final class App: NSObject, NSApplicationDelegate {
     }
 }
 
-/// `Makishot --selftest`: renders a selection with one annotation and checks the output.
+/// `justcap --selftest`: renders a selection with one annotation and checks the output.
 func selftest() {
     let space = CGColorSpaceCreateDeviceRGB()
     let ctx = CGContext(data: nil, width: 200, height: 100, bitsPerComponent: 8, bytesPerRow: 0, space: space,

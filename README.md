@@ -1,6 +1,6 @@
-# Makishot
+# justcap
 
-A small screenshot tool for macOS. Makishot replaces Lightshot.
+A small screenshot tool for macOS. justcap replaces Lightshot.
 It has no upload, no web search and no network access.
 
 - Native Swift and AppKit. No dependencies.
@@ -15,12 +15,12 @@ It has no upload, no web search and no network access.
 ## Build
 
 ```bash
-./build.sh            # builds build/Makishot.app and does the self-test
+./build.sh            # builds build/justcap.app and does the self-test
 ./build.sh install    # also copies the app to /Applications and starts it
 ```
 
 At the first capture, macOS asks for the Screen Recording permission.
-Give the permission in System Settings > Privacy & Security, then start Makishot again.
+Give the permission in System Settings > Privacy & Security, then start justcap again.
 
 `build.sh` signs the app with the `Apple Development` identity. Set `SIGN_ID` to use a different identity.
 If no identity is available, the signature is ad hoc and macOS asks for the permission again after each build.
@@ -38,7 +38,11 @@ Press ⇧⌘9, or select Capture in the menu bar. Then drag to select an area.
 | ⌘Z | Removes the last annotation |
 | Esc | Closes the overlay |
 | Shift + drag | Line and arrow: 45° steps. Rectangle and pixelate: square |
-| Scroll | Changes the line width and the text size (1 to 20 pt) |
+| Scroll | Changes the line width and the text size. A preview shows the size at the pointer |
+| Scroll during text entry | Changes the size of that text |
+| Text tool: drag a text | Moves the text |
+| Text tool: click a text | Edits the text again |
+| Text tool: scroll on a text | Changes the size of that text |
 
 Tools: pen, line, arrow, rectangle, marker, text, pixelate, color.
 Click the active tool again to go back to move mode.
@@ -53,7 +57,7 @@ To change the hotkey, edit `hotkeyCode` and `hotkeyModifiers` in `Sources/main.s
 
 ## Limits
 
-- Text annotations have one line. Press Return to complete the text.
+- Text annotations have one line. Press Return to complete the text. Esc cancels the edit.
 - A selection stays on one screen.
 - The pixelate tool reads the screen image only. It does not hide other annotations.
 
