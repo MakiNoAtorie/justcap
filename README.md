@@ -69,3 +69,7 @@ To change the hotkey, edit `hotkeyCode` and `hotkeyModifiers` in `Sources/main.s
 | `Sources/Overlay.swift` | Selection, toolbar, annotation tools, render |
 | `Info.plist` | Bundle data. `LSUIElement` hides the Dock icon |
 | `build.sh` | Build, signature, self-test, install |
+
+## License
+
+MIT. Refer to `LICENSE`.
