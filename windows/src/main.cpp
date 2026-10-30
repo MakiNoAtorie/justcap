@@ -9,6 +9,7 @@
 #include <mmsystem.h>
 #include <cstdint>
 #include <cwchar>
+#include <string>
 #include <vector>
 
 #define STR2(x) L#x
@@ -17,6 +18,7 @@
 // Global hotkey: PrtScn (the Lightshot default on Windows). Change it with
 // `reg add HKCU\Software\justcap /v hotkeyVK /t REG_DWORD /d 0x33 /f` and `hotkeyMods`.
 static const UINT defaultVK = VK_SNAPSHOT, defaultMods = 0;
+static const wchar_t* runKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const UINT WM_TRAY = WM_APP + 1, WM_FINISH = WM_APP + 2;
 enum { ID_CAPTURE = 1, ID_LOGIN, ID_QUIT };
 enum { TIMER_CAPTURE = 1 };
@@ -291,9 +293,27 @@ static void removeTray() {
     Shell_NotifyIconW(NIM_DELETE, &n);
 }
 
+static bool loginEnabled() {
+    return RegGetValueW(HKEY_CURRENT_USER, runKey, L"justcap", RRF_RT_REG_SZ, NULL, NULL, NULL) == ERROR_SUCCESS;
+}
+
+static void toggleLogin() {
+    LSTATUS status;
+    if (loginEnabled()) {
+        status = RegDeleteKeyValueW(HKEY_CURRENT_USER, runKey, L"justcap");
+    } else {
+        wchar_t path[MAX_PATH];
+        GetModuleFileNameW(NULL, path, MAX_PATH);
+        std::wstring quoted = L"\"" + std::wstring(path) + L"\"";
+        status = RegSetKeyValueW(HKEY_CURRENT_USER, runKey, L"justcap", REG_SZ, quoted.c_str(), DWORD((quoted.size() + 1) * sizeof(wchar_t)));
+    }
+    if (status != ERROR_SUCCESS) alert(L"justcap cannot change the Launch at Login setting.");
+}
+
 static void showMenu(int x, int y) {
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_CAPTURE, custom ? L"Capture" : L"Capture  PrtScn");
+    AppendMenuW(menu, MF_STRING | (loginEnabled() ? MF_CHECKED : 0), ID_LOGIN, L"Launch at Login");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit justcap");
     previous = GetForegroundWindow();
@@ -330,6 +350,7 @@ static LRESULT CALLBACK appProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         // Lets the tray menu fade out first, so it is not in the capture.
         case ID_CAPTURE: SetTimer(hwnd, TIMER_CAPTURE, 150, NULL); break;
+        case ID_LOGIN: toggleLogin(); break;
         case ID_QUIT: DestroyWindow(hwnd); break;
         }
         return 0;
@@ -343,6 +364,17 @@ static LRESULT CALLBACK appProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/// Windows 11 22H2 and later: the Snipping Tool gets PrtScn first, and RegisterHotKey still succeeds.
+static bool snippingOwnsPrintScreen() {
+    DWORD enabled, size = sizeof enabled;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Control Panel\\Keyboard", L"PrintScreenKeyForSnippingEnabled", RRF_RT_REG_DWORD, NULL, &enabled, &size) == ERROR_SUCCESS)
+        return enabled != 0;
+    wchar_t build[16] = L"";
+    DWORD bytes = sizeof build;
+    RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"CurrentBuildNumber", RRF_RT_REG_SZ, NULL, build, &bytes);
+    return _wtoi(build) >= 22621;
 }
 
 static void say(const char* text) {
@@ -395,6 +427,23 @@ static int selftest() {
         }
     }
     if (!glyph) return say("selftest failed: text\n"), 1;
+
+    // 125 %: the output must match the source pixel by pixel.
+    for (size_t i = 0; i < source.size(); i++) source[i] = 0xFF000000 | (uint32_t(i) * 2654435761u >> 8);
+    ComPtr<IWICBitmap> noise, fractional;
+    wic->CreateBitmapFromMemory(200, 100, GUID_WICPixelFormat32bppPBGRA, 800, UINT(source.size() * 4), reinterpret_cast<BYTE*>(source.data()), &noise);
+    Overlay scaled(noise, RECT{0, 0, 200, 100}, 1.25, false);
+    scaled.sel = Rect{17 / 1.25, 11 / 1.25, 101 / 1.25, 53 / 1.25};
+    fractional = scaled.render();
+    if (fractional) fractional->GetSize(&w, &h);
+    if (!fractional || w != 101 || h != 53) return say("selftest failed: size at 125 %\n"), 1;
+    WICRect part = {0, 0, 101, 53};
+    ComPtr<IWICBitmapLock> partLock;
+    fractional->Lock(&part, WICBitmapLockRead, &partLock);
+    partLock->GetStride(&stride);
+    partLock->GetDataPointer(&size, &px);
+    for (UINT y = 0; y < h; y++)
+        if (memcmp(px + y * stride, &source[(y + 11) * 200 + 17], 101 * 4) != 0) return say("selftest failed: pixels at 125 %\n"), 1;
     say("selftest ok\n");
     return 0;
 }
@@ -419,7 +468,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
 
     UINT vk = regGet(L"hotkeyVK", defaultVK), mods = regGet(L"hotkeyMods", defaultMods);
     custom = vk != defaultVK || mods != defaultMods;
-    if (!RegisterHotKey(app, 1, mods | MOD_NOREPEAT, vk)) {
+    if (!RegisterHotKey(app, 1, mods | MOD_NOREPEAT, vk) || (vk == VK_SNAPSHOT && mods == 0 && snippingOwnsPrintScreen())) {
         alert(L"The justcap hotkey is not available. Another app uses it. On Windows 11 the Snipping Tool uses PrtScn: "
               L"turn off Settings > Accessibility > Keyboard > \"Use the Print screen key to open screen capture\", or set another hotkey:\n\n"
               L"reg add HKCU\\Software\\justcap /v hotkeyVK /t REG_DWORD /d 0x33 /f\n"
