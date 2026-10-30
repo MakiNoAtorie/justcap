@@ -365,6 +365,7 @@ static int selftest() {
         {Tool::line, {0, 1, 0, 1}, 4, {{36, 25}, {60, 25}}},
         // One 10 DIP block across the red/blue boundary at x = 50.
         {Tool::pixelate, {0, 0, 1, 1}, 4, {{45, 28}, {55, 38}}},
+        {Tool::text, {1, 1, 1, 1}, 3, {{22, 20}}, L"H"},
     };
     ComPtr<IWICBitmap> out = view.render();
     UINT w = 0, h = 0, stride, size;
@@ -386,6 +387,14 @@ static int selftest() {
     if (!(red.r > 0.9 && red.b < 0.1)) return say("selftest failed: source image, red half\n"), 1;
     if (!(blue.b > 0.9 && blue.r < 0.1)) return say("selftest failed: source image, blue half\n"), 1;
     if (!(blocks.r > 0.2 && blocks.r < 0.8 && blocks.b > 0.2 && blocks.b < 0.8)) return say("selftest failed: pixelate\n"), 1;
+    bool glyph = false;
+    for (int x = 4; x < 28; x++) {
+        for (int y = 0; y < 36; y++) {
+            Color c = at(x, y);
+            glyph = glyph || (c.r > 0.9 && c.g > 0.9 && c.b > 0.9);
+        }
+    }
+    if (!glyph) return say("selftest failed: text\n"), 1;
     say("selftest ok\n");
     return 0;
 }

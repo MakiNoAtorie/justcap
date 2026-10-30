@@ -133,7 +133,18 @@ private:
     std::optional<int> textIndex(Pt) const;
     Rect textRect(const Annotation&) const;
     void commitText();
-    void beginText(Pt);
+    void beginText(Pt, std::optional<Annotation> editing = std::nullopt);
+    double fieldHeight() const;
+    Rect fieldFrame() const;
+    Rect fieldBox() const;
+    void fieldChanged();
+    void insertText(const std::wstring&);
+    void eraseChar(bool forward);
+    void keyEdit(WPARAM, bool ctrl);
+    void pasteText();
+    void copyText();
+    void drawField();
+    void dottedBox(const Rect&);
 
     ComPtr<IWICBitmap> image;
     double k;
@@ -150,6 +161,17 @@ private:
     double width;
     int scrollAcc = 0;
     std::optional<Pt> preview;
+    // ponytail: single-line text, Return commits. Replace with a multi-line editor if multi-line text becomes necessary.
+    bool editing = false;
+    std::wstring text, undoText;
+    size_t caret = 0;
+    bool allSelected = false;
+    Pt fieldOrigin;
+    D2D1_COLOR_F fieldColor = {};
+    Rect fieldDirty;
+    /// The text being re-edited, and the width to restore after the edit.
+    std::optional<Annotation> edited;
+    double widthBeforeEdit = 3;
     Rect barRect;
     bool barHidden = true;
     HCURSOR cursor;

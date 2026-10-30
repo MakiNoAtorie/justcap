@@ -8,7 +8,7 @@ ComPtr<IWICImagingFactory> wic;
 static ComPtr<ID2D1Factory> d2d;
 static ComPtr<IDWriteFactory> dw;
 static ComPtr<IDWriteTextFormat> labelFormat, iconFormat;
-static ComPtr<ID2D1StrokeStyle> roundStroke, miterStroke;
+static ComPtr<ID2D1StrokeStyle> roundStroke, miterStroke, dashStroke[2];
 static const wchar_t* windowClass = L"justcap.overlay";
 
 static const struct {
@@ -39,6 +39,12 @@ void gfxInit() {
     d2d->CreateStrokeStyle(stroke, NULL, 0, &roundStroke);
     stroke = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_LINE_JOIN_MITER);
     d2d->CreateStrokeStyle(stroke, NULL, 0, &miterStroke);
+    const float dashes[] = {3, 3};
+    for (int i = 0; i < 2; i++) {
+        stroke = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_LINE_JOIN_MITER, 10,
+                                             D2D1_DASH_STYLE_CUSTOM, i * 3.0f);
+        d2d->CreateStrokeStyle(stroke, dashes, 2, &dashStroke[i]);
+    }
     WNDCLASSW wc = {};
     wc.lpfnWndProc = Overlay::proc;
     wc.hInstance = GetModuleHandleW(NULL);
@@ -56,6 +62,16 @@ static ComPtr<ID2D1SolidColorBrush> brush(ID2D1RenderTarget* t, D2D1_COLOR_F c) 
     ComPtr<ID2D1SolidColorBrush> b;
     t->CreateSolidColorBrush(c, &b);
     return b;
+}
+
+static IDWriteTextFormat* font(double width) {
+    static ComPtr<IDWriteTextFormat> formats[21];
+    int i = std::clamp(int(width), 1, 20);
+    if (!formats[i]) {
+        dw->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, float(10 + i * 2), L"", &formats[i]);
+        formats[i]->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    }
+    return formats[i].Get();
 }
 
 static ComPtr<IDWriteTextLayout> layout(const std::wstring& s, IDWriteTextFormat* f) {
@@ -132,6 +148,11 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_KEYDOWN: {
         bool shift = GetKeyState(VK_SHIFT) & 0x8000, ctrl = GetKeyState(VK_CONTROL) & 0x8000;
+        // While a text is typed, the keys belong to the text.
+        if (editing) {
+            keyEdit(wp, ctrl);
+            return 0;
+        }
         if (ctrl && (wp == 'C' || wp == 'S')) finish(wp == 'S');
         if (ctrl && wp == 'Z') undo();
         switch (wp) {
@@ -144,6 +165,10 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    case WM_CHAR:
+        if (editing && wp == 0x08) eraseChar(false);
+        else if (editing && wp >= 0x20 && wp != 0x7F) insertText(std::wstring(1, wchar_t(wp)));
+        return 0;
     case WM_MOUSEMOVE:
         if (wp & MK_LBUTTON) mouseDragged(mouse(lp), wp & MK_SHIFT);
         else mouseMoved(mouse(lp));
@@ -235,6 +260,10 @@ void Overlay::setColor(int i) {
     colorIndex = i;
     regSet(L"color", i);
     if (!barHidden) invalidate(barRect);
+    if (editing) {
+        fieldColor = palette[i].color;
+        fieldChanged();
+    }
 }
 
 void Overlay::setWidth(double w) {
@@ -251,10 +280,11 @@ void Overlay::setPreview(std::optional<Pt> p) {
 
 void Overlay::mouseMoved(Pt p) {
     bool onBar = !barHidden && barRect.contains(p);
-    auto hover = tool == Tool::text && !onBar ? textIndex(p) : std::nullopt;
+    auto hover = tool == Tool::text && !editing && !onBar ? textIndex(p) : std::nullopt;
     if (hover != hoverText) setHover(hover);
     if (onBar) return setCursor(IDC_ARROW);
     if (!sel) return setCursor(IDC_CROSS);
+    if (editing && fieldFrame().contains(p)) return setCursor(IDC_IBEAM);
     if (auto h = handleHit(p, *sel)) {
         setCursor(h->hy == 0 ? IDC_SIZEWE : h->hx == 0 ? IDC_SIZENS : h->hx * h->hy > 0 ? IDC_SIZENWSE : IDC_SIZENESW);
     } else if (hoverText) {
@@ -369,6 +399,17 @@ void Overlay::nudge(double dx, double dy, bool shift) {
 // MARK: Mouse
 
 void Overlay::mouseDown(Pt p) {
+    // A click in the field places the caret, as in a text control.
+    if (editing && fieldFrame().contains(p)) {
+        BOOL trailing, inside;
+        DWRITE_HIT_TEST_METRICS m;
+        layout(text, font(width))->HitTestPoint(float(p.x - fieldOrigin.x), float(p.y - fieldOrigin.y), &trailing, &inside, &m);
+        caret = m.textPosition + (trailing ? m.length : 0);
+        allSelected = false;
+        fieldChanged();
+        return;
+    }
+    bool wasEditing = editing;
     commitText();
     setPreview(std::nullopt);
     setHover(std::nullopt);
@@ -386,7 +427,16 @@ void Overlay::mouseDown(Pt p) {
         }
         if (s.contains(p)) {
             if (tool == Tool::text) {
-                beginText(p);
+                // Drag moves an existing text. A click without movement edits it (see mouseUp).
+                // A click away from a text in edit only completes that text.
+                if (auto i = textIndex(p)) {
+                    drag = {};
+                    drag.kind = Drag::text;
+                    drag.index = *i;
+                    drag.start = drag.last = p;
+                } else if (!wasEditing) {
+                    beginText(p);
+                }
             } else if (tool) {
                 current = Annotation{*tool, palette[colorIndex].color, width, {p, p}};
                 drag = {};
@@ -434,8 +484,20 @@ void Overlay::mouseDragged(Pt p, bool shift) {
         setSel(r);
         break;
     }
-    case Drag::text:
+    case Drag::text: {
+        if (!sel) break;
+        // Keep the text inside the selection, or it can no longer be reached.
+        const Rect s = *sel;
+        Annotation& a = annotations[drag.index];
+        Rect r = textRect(a);
+        a.points[0] = {std::max(s.x, std::min(r.x + p.x - drag.last.x, s.right() - r.w)),
+                       std::max(s.y, std::min(r.y + p.y - drag.last.y, s.bottom() - r.h))};
+        annotationsChanged();
+        drag.last = p;
+        setHover(drag.index);
+        setCursor(IDC_SIZEALL);
         break;
+    }
     case Drag::draw: {
         if (!current) break;
         Annotation& a = *current;
@@ -471,6 +533,12 @@ void Overlay::mouseUp() {
         annotationsChanged();
         setSel(std::nullopt);
     }
+    if (drag.kind == Drag::text && std::hypot(drag.last.x - drag.start.x, drag.last.y - drag.start.y) < 3) {
+        Annotation a = annotations[drag.index];
+        annotations.erase(annotations.begin() + drag.index);
+        annotationsChanged();
+        beginText(drag.start, a);
+    }
     drag = {};
     layoutBar();
 }
@@ -481,9 +549,25 @@ void Overlay::scrollWheel(Pt p, int delta) {
     if (std::abs(scrollAcc) < WHEEL_DELTA) return;
     double d = scrollAcc > 0 ? 1 : -1;
     scrollAcc = 0;
+    // Text tool, pointer on an existing text: change the size of that text only.
+    if (!editing && tool == Tool::text) {
+        if (auto i = textIndex(p)) {
+            setHover(hoverText);
+            annotations[*i].width = std::clamp(annotations[*i].width + d, 1.0, 20.0);
+            annotationsChanged();
+            setHover(hoverText);
+            return;
+        }
+    }
+    double middle = fieldOrigin.y + fieldHeight() / 2;
     setWidth(std::clamp(width + d, 1.0, 20.0));
-    setPreview(p);
-    SetTimer(hwnd, 1, 800, NULL);
+    if (editing) {
+        fieldOrigin.y = middle - fieldHeight() / 2;
+        fieldChanged();
+    } else {
+        setPreview(p);
+        SetTimer(hwnd, 1, 800, NULL);
+    }
     invalidate(chrome(*sel));  // the size label shows the width
 }
 
@@ -523,10 +607,181 @@ Pt Overlay::constrain(Pt a, Pt p, bool square) const {
 
 // MARK: Text
 
-std::optional<int> Overlay::textIndex(Pt) const { return std::nullopt; }
-Rect Overlay::textRect(const Annotation&) const { return {}; }
-void Overlay::commitText() {}
-void Overlay::beginText(Pt) {}
+Rect Overlay::textRect(const Annotation& a) const {
+    Pt size = extent(layout(a.text, font(a.width)).Get());
+    return {a.points[0].x, a.points[0].y, size.x, size.y};
+}
+
+std::optional<int> Overlay::textIndex(Pt p) const {
+    for (int i = int(annotations.size()) - 1; i >= 0; i--)
+        if (annotations[i].tool == Tool::text && textRect(annotations[i]).contains(p)) return i;
+    return std::nullopt;
+}
+
+double Overlay::fieldHeight() const { return extent(layout(L"A", font(width)).Get()).y; }
+
+/// The area that takes clicks: from the text to the right edge of the selection.
+Rect Overlay::fieldFrame() const {
+    return {fieldOrigin.x, fieldOrigin.y, std::max(40.0, sel->right() - fieldOrigin.x), fieldHeight()};
+}
+
+/// The dotted box, as wide as the text. 2 DIP of air on each side.
+Rect Overlay::fieldBox() const {
+    return {fieldOrigin.x - 2, fieldOrigin.y, std::max(40.0, extent(layout(text, font(width)).Get()).x + 4), fieldHeight()};
+}
+
+/// Redraws the field and keeps the IME candidate window at the caret.
+void Overlay::fieldChanged() {
+    Rect box = fieldBox().inset(-4, -4);
+    invalidate(fieldDirty);
+    invalidate(box);
+    fieldDirty = box;
+    if (!hwnd) return;
+    FLOAT x, y;
+    DWRITE_HIT_TEST_METRICS m;
+    layout(text, font(width))->HitTestTextPosition(UINT32(caret), FALSE, &x, &y, &m);
+    COMPOSITIONFORM form = {CFS_POINT, {std::lround((fieldOrigin.x + x) * k), std::lround(fieldOrigin.y * k)}};
+    HIMC context = ImmGetContext(hwnd);
+    ImmSetCompositionWindow(context, &form);
+    ImmReleaseContext(hwnd, context);
+}
+
+void Overlay::beginText(Pt p, std::optional<Annotation> a) {
+    if (!sel) return;
+    if (a) {
+        widthBeforeEdit = width;
+        setWidth(a->width);
+    }
+    edited = a;
+    text = a ? a->text : L"";
+    undoText = text;
+    caret = text.size();
+    allSelected = a && !text.empty();  // As a text control does when it gets the focus.
+    fieldColor = a ? a->color : palette[colorIndex].color;
+    fieldOrigin = a ? a->points[0] : Pt{p.x, p.y - fieldHeight() / 2};
+    editing = true;
+    setHover(std::nullopt);
+    fieldDirty = fieldBox().inset(-4, -4);
+    fieldChanged();
+}
+
+void Overlay::commitText() {
+    if (!editing) return;
+    editing = false;
+    invalidate(fieldDirty);
+    if (!text.empty()) {
+        annotations.push_back({Tool::text, fieldColor, width, {fieldOrigin}, text});
+        annotationsChanged();
+    } else if (edited) {
+        annotations.push_back(*edited);  // a re-edit that ends empty keeps the original
+        annotationsChanged();
+    }
+    if (edited) setWidth(widthBeforeEdit);
+    edited = std::nullopt;
+}
+
+void Overlay::insertText(const std::wstring& s) {
+    undoText = text;
+    if (allSelected) {
+        text.clear();
+        caret = 0;
+    }
+    allSelected = false;
+    text.insert(caret, s);
+    caret += s.size();
+    fieldChanged();
+}
+
+void Overlay::eraseChar(bool forward) {
+    undoText = text;
+    if (allSelected) {
+        text.clear();
+        caret = 0;
+        allSelected = false;
+    } else if (forward && caret < text.size()) {
+        text.erase(caret, IS_HIGH_SURROGATE(text[caret]) ? 2 : 1);
+    } else if (!forward && caret > 0) {
+        size_t n = caret > 1 && IS_LOW_SURROGATE(text[caret - 1]) ? 2 : 1;
+        caret -= n;
+        text.erase(caret, n);
+    }
+    fieldChanged();
+}
+
+void Overlay::copyText() {
+    if (!allSelected || !OpenClipboard(hwnd)) return;
+    EmptyClipboard();
+    size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        memcpy(GlobalLock(mem), text.c_str(), bytes);
+        GlobalUnlock(mem);
+        SetClipboardData(CF_UNICODETEXT, mem);
+    }
+    CloseClipboard();
+}
+
+void Overlay::pasteText() {
+    if (!OpenClipboard(hwnd)) return;
+    std::wstring s;
+    if (HGLOBAL mem = GetClipboardData(CF_UNICODETEXT)) {
+        s = static_cast<const wchar_t*>(GlobalLock(mem));
+        GlobalUnlock(mem);
+    }
+    CloseClipboard();
+    s.erase(std::remove_if(s.begin(), s.end(), [](wchar_t c) { return c < 0x20; }), s.end());
+    if (!s.empty()) insertText(s);
+}
+
+void Overlay::keyEdit(WPARAM wp, bool ctrl) {
+    switch (wp) {
+    case VK_RETURN:
+        commitText();
+        return;
+    case VK_ESCAPE:  // Drop a new text, keep the original of a re-edited one.
+        text.clear();
+        commitText();
+        return;
+    case VK_LEFT:
+        if (allSelected) caret = 0;
+        else if (caret > 0) caret -= caret > 1 && IS_LOW_SURROGATE(text[caret - 1]) ? 2 : 1;
+        break;
+    case VK_RIGHT:
+        if (allSelected) caret = text.size();
+        else if (caret < text.size()) caret += IS_HIGH_SURROGATE(text[caret]) ? 2 : 1;
+        break;
+    case VK_HOME:
+        caret = 0;
+        break;
+    case VK_END:
+        caret = text.size();
+        break;
+    case VK_DELETE:
+        return eraseChar(true);
+    case 'A':
+        if (!ctrl) return;
+        allSelected = !text.empty();
+        return fieldChanged();
+    case 'C':
+        if (ctrl) copyText();
+        return;
+    case 'X':
+        if (!ctrl || !allSelected) return;
+        copyText();
+        return eraseChar(false);
+    case 'V':
+        if (ctrl) pasteText();
+        return;
+    case 'Z':
+        if (!ctrl) return;
+        text.swap(undoText);
+        caret = text.size();
+        break;
+    default:
+        return;
+    }
+    allSelected = false;
+    fieldChanged();
+}
 
 // MARK: Drawing
 
@@ -597,11 +852,14 @@ void Overlay::draw() {
         t->FillRectangle(dx(r), white.Get());
         t->DrawRectangle(dx(r), black.Get());
     }
+    if (editing) dottedBox(fieldBox());
+    else if (hoverText && *hoverText < int(annotations.size())) dottedBox(textRect(annotations[*hoverText]).inset(-2, -2));
     t->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    if (editing) drawField();
 
-    wchar_t text[64];
-    swprintf(text, 64, L" %ld × %ld   %d pt ", std::lround(s.w * k), std::lround(s.h * k), int(width));
-    auto l = layout(text, labelFormat.Get());
+    wchar_t label[64];
+    swprintf(label, 64, L" %ld × %ld   %d pt ", std::lround(s.w * k), std::lround(s.h * k), int(width));
+    auto l = layout(label, labelFormat.Get());
     Pt size = extent(l.Get());
     Pt at = {s.x, s.y - size.y - 4 < 0 ? s.y + 4 : s.y - size.y - 4};
     t->FillRectangle(dx(Rect{at.x, at.y, size.x, size.y}), brush(t, D2D1::ColorF(0, 0.7f)).Get());
@@ -630,9 +888,40 @@ ComPtr<IWICBitmap> Overlay::render() {
     return SUCCEEDED(t->EndDraw()) ? out : nullptr;
 }
 
+/// Editor chrome around a text: black and white dashes, visible on any background.
+void Overlay::dottedBox(const Rect& r) {
+    ID2D1RenderTarget* t = rt.Get();
+    double x0 = std::floor(r.x), y0 = std::floor(r.y);
+    Rect q = {x0 + 0.5, y0 + 0.5, std::ceil(r.right()) - x0 - 1, std::ceil(r.bottom()) - y0 - 1};
+    t->DrawRectangle(dx(q), brush(t, D2D1::ColorF(D2D1::ColorF::Black)).Get(), 1, dashStroke[0].Get());
+    t->DrawRectangle(dx(q), brush(t, D2D1::ColorF(D2D1::ColorF::White)).Get(), 1, dashStroke[1].Get());
+}
+
+/// The text in edit, in the same font and place as the annotation it becomes.
+void Overlay::drawField() {
+    ID2D1RenderTarget* t = rt.Get();
+    auto l = layout(text, font(width));
+    Pt size = extent(l.Get());
+    auto b = brush(t, fieldColor);
+    t->PushAxisAlignedClip(dx(*sel), D2D1_ANTIALIAS_MODE_ALIASED);
+    if (allSelected) t->FillRectangle(dx(Rect{fieldOrigin.x, fieldOrigin.y, size.x, size.y}), brush(t, D2D1::ColorF(0.1f, 0.5f, 1, 0.5f)).Get());
+    t->DrawTextLayout(dx(fieldOrigin), l.Get(), b.Get());
+    FLOAT x, y;
+    DWRITE_HIT_TEST_METRICS m;
+    l->HitTestTextPosition(UINT32(caret), FALSE, &x, &y, &m);
+    if (!allSelected) t->FillRectangle(dx(Rect{fieldOrigin.x + x, fieldOrigin.y, 1, size.y}), b.Get());
+    t->PopAxisAlignedClip();
+}
+
 /// The size of the next line or text, at the pointer. Not part of the output image.
 void Overlay::drawPreview(Pt p) {
     ID2D1RenderTarget* t = rt.Get();
+    if (tool == Tool::text) {
+        auto l = layout(L"Aa", font(width));
+        Pt size = extent(l.Get());
+        t->DrawTextLayout(dx(Pt{p.x - size.x / 2, p.y - size.y / 2}), l.Get(), brush(t, palette[colorIndex].color).Get());
+        return;
+    }
     double d = tool == Tool::marker ? width * 5 : width;
     D2D1_COLOR_F c = palette[colorIndex].color;
     if (tool == Tool::marker) c.a = 0.4f;
@@ -677,11 +966,12 @@ void Overlay::drawAnnotation(ID2D1RenderTarget* t, const Annotation& a) {
         t->DrawRectangle(dx(box(a)), b.Get(), w, miterStroke.Get());
         break;
     case Tool::text:
+        t->DrawTextLayout(dx(a0), layout(a.text, font(a.width)).Get(), b.Get());
         break;
     case Tool::pixelate: {
-        ComPtr<IWICBitmap> small = a.blocks ? a.blocks : blocks(box(a));
+        ComPtr<IWICBitmap> scaled = a.blocks ? a.blocks : blocks(box(a));
         ComPtr<ID2D1Bitmap> bitmap;
-        if (small && SUCCEEDED(t->CreateBitmapFromWicBitmap(small.Get(), &bitmap)))
+        if (scaled && SUCCEEDED(t->CreateBitmapFromWicBitmap(scaled.Get(), &bitmap)))
             t->DrawBitmap(bitmap.Get(), dx(intersect(box(a), bounds)), 1, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
         break;
     }
