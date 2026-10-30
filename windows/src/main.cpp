@@ -379,7 +379,9 @@ static bool snippingOwnsPrintScreen() {
 
 static void say(const char* text) {
     DWORD written;
-    if (AttachConsole(ATTACH_PARENT_PROCESS)) WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), text, DWORD(strlen(text)), &written, NULL);
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);  // A redirected stdout comes first: AttachConsole replaces it.
+    if ((!out || out == INVALID_HANDLE_VALUE) && AttachConsole(ATTACH_PARENT_PROCESS)) out = GetStdHandle(STD_OUTPUT_HANDLE);
+    WriteFile(out, text, DWORD(strlen(text)), &written, NULL);
 }
 
 /// `justcap --selftest`: renders a selection with annotations and checks the output.
