@@ -176,8 +176,8 @@ static bool copyImage(IWICBitmap* image) {
         return false;
     }
     EmptyClipboard();
-    SetClipboardData(RegisterClipboardFormatW(L"PNG"), png);
-    SetClipboardData(CF_DIB, dib);
+    if (!SetClipboardData(RegisterClipboardFormatW(L"PNG"), png)) GlobalFree(png);
+    if (!SetClipboardData(CF_DIB, dib)) GlobalFree(dib);
     CloseClipboard();
     return true;
 }
@@ -311,6 +311,7 @@ static void toggleLogin() {
 }
 
 static void showMenu(int x, int y) {
+    if (modal) return;
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_CAPTURE, custom ? L"Capture" : L"Capture  PrtScn");
     AppendMenuW(menu, MF_STRING | (loginEnabled() ? MF_CHECKED : 0), ID_LOGIN, L"Launch at Login");

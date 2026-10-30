@@ -147,7 +147,7 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
         cancel();
         return 0;
     case WM_KEYDOWN: {
-        bool shift = GetKeyState(VK_SHIFT) & 0x8000, ctrl = GetKeyState(VK_CONTROL) & 0x8000;
+        bool shift = GetKeyState(VK_SHIFT) & 0x8000, ctrl = (GetKeyState(VK_CONTROL) & 0x8000) && !(GetKeyState(VK_MENU) & 0x8000);
         // While a text is typed, the keys belong to the text.
         if (editing) {
             keyEdit(wp, ctrl);
@@ -166,8 +166,12 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_CHAR:
-        if (editing && wp == 0x08) eraseChar(false);
-        else if (editing && wp >= 0x20 && wp != 0x7F) insertText(std::wstring(1, wchar_t(wp)));
+        if (!editing) return 0;
+        if (wp == 0x08) eraseChar(false);
+        else if (IS_HIGH_SURROGATE(wp)) highSurrogate = wchar_t(wp);
+        else if (IS_LOW_SURROGATE(wp) && highSurrogate) insertText({highSurrogate, wchar_t(wp)});
+        else if (wp >= 0x20 && wp != 0x7F) insertText(std::wstring(1, wchar_t(wp)));
+        if (!IS_HIGH_SURROGATE(wp)) highSurrogate = 0;
         return 0;
     case WM_MOUSEMOVE:
         if (wp & MK_LBUTTON) mouseDragged(mouse(lp), wp & MK_SHIFT);
@@ -197,12 +201,14 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEWHEEL: {
         POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};  // Screen coordinates.
         ScreenToClient(hwnd, &p);
+        if (!bounds.contains({p.x / k, p.y / k})) return 0;
         scrollWheel({p.x / k, p.y / k}, GET_WHEEL_DELTA_WPARAM(wp));
         return 0;
     }
     case WM_TIMER:
         KillTimer(hwnd, wp);
-        setPreview(std::nullopt);
+        if (wp == 2) InvalidateRect(hwnd, NULL, FALSE);
+        else setPreview(std::nullopt);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -269,6 +275,7 @@ void Overlay::setColor(int i) {
 void Overlay::setWidth(double w) {
     width = w;
     regSet(L"width", DWORD(w));
+    if (sel) invalidate(chrome(*sel));
 }
 
 void Overlay::setPreview(std::optional<Pt> p) {
@@ -346,7 +353,7 @@ void Overlay::press(int i) {
 }
 
 void Overlay::pickColor() {
-    int size = GetSystemMetrics(SM_CXMENUCHECK);
+    int size = GetSystemMetricsForDpi(SM_CXMENUCHECK, UINT(96 * k));
     HMENU menu = CreatePopupMenu();
     HDC screen = GetDC(hwnd), mem = CreateCompatibleDC(screen);
     HBITMAP swatches[paletteCount];
@@ -379,6 +386,7 @@ void Overlay::pickColor() {
 }
 
 void Overlay::undo() {
+    if (drag.kind == Drag::text) return;
     commitText();
     if (annotations.empty()) return;
     annotations.pop_back();
@@ -568,7 +576,6 @@ void Overlay::scrollWheel(Pt p, int delta) {
         setPreview(p);
         SetTimer(hwnd, 1, 800, NULL);
     }
-    invalidate(chrome(*sel));  // the size label shows the width
 }
 
 void Overlay::clearSelection() {
@@ -715,7 +722,7 @@ void Overlay::copyText() {
     if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
         memcpy(GlobalLock(mem), text.c_str(), bytes);
         GlobalUnlock(mem);
-        SetClipboardData(CF_UNICODETEXT, mem);
+        if (!SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
     }
     CloseClipboard();
 }
@@ -724,8 +731,10 @@ void Overlay::pasteText() {
     if (!OpenClipboard(hwnd)) return;
     std::wstring s;
     if (HGLOBAL mem = GetClipboardData(CF_UNICODETEXT)) {
-        s = static_cast<const wchar_t*>(GlobalLock(mem));
-        GlobalUnlock(mem);
+        if (auto p = static_cast<const wchar_t*>(GlobalLock(mem))) {
+            s = p;
+            GlobalUnlock(mem);
+        }
     }
     CloseClipboard();
     s.erase(std::remove_if(s.begin(), s.end(), [](wchar_t c) { return c < 0x20; }), s.end());
@@ -747,7 +756,7 @@ void Overlay::keyEdit(WPARAM wp, bool ctrl) {
         break;
     case VK_RIGHT:
         if (allSelected) caret = text.size();
-        else if (caret < text.size()) caret += IS_HIGH_SURROGATE(text[caret]) ? 2 : 1;
+        else if (caret < text.size()) caret = std::min(text.size(), caret + (IS_HIGH_SURROGATE(text[caret]) ? 2 : 1));
         break;
     case VK_HOME:
         caret = 0;
@@ -808,7 +817,10 @@ void Overlay::createTarget() {
     auto props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1::PixelFormat(), dpi, dpi);
     // Partial redraw needs the back buffer kept between frames.
     auto hprops = D2D1::HwndRenderTargetProperties(hwnd, D2D1::SizeU(c.right, c.bottom), D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS);
-    d2d->CreateHwndRenderTarget(props, hprops, &rt);
+    if (FAILED(d2d->CreateHwndRenderTarget(props, hprops, &rt))) {
+        rt = nullptr;
+        return;
+    }
     rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     rt->CreateBitmapFromWicBitmap(image.Get(), &bmp);
 }
@@ -817,6 +829,13 @@ void Overlay::paint() {
     PAINTSTRUCT ps;
     BeginPaint(hwnd, &ps);
     if (!rt) createTarget();
+    // The device is lost: try again later.
+    if (!rt || !bmp) {
+        rt = nullptr;
+        EndPaint(hwnd, &ps);
+        SetTimer(hwnd, 2, 100, NULL);
+        return;
+    }
     Rect dirty = {ps.rcPaint.left / k, ps.rcPaint.top / k, (ps.rcPaint.right - ps.rcPaint.left) / k, (ps.rcPaint.bottom - ps.rcPaint.top) / k};
     rt->BeginDraw();
     rt->PushAxisAlignedClip(dx(dirty), D2D1_ANTIALIAS_MODE_ALIASED);

@@ -166,6 +166,7 @@ private:
     std::wstring text, undoText;
     size_t caret = 0;
     bool allSelected = false;
+    wchar_t highSurrogate = 0;
     Pt fieldOrigin;
     D2D1_COLOR_F fieldColor = {};
     Rect fieldDirty;
