@@ -66,6 +66,8 @@ public:
     /// Called when a new selection starts here, so the other monitors can clear theirs.
     std::function<void()> onSelectionStart;
     void clearSelection();
+    /// The selection with its annotations, at the pixel resolution of the monitor.
+    ComPtr<IWICBitmap> render();
     static LRESULT CALLBACK proc(HWND, UINT, WPARAM, LPARAM);
 
 private:
@@ -89,6 +91,7 @@ private:
     void draw();
     void drawBar();
     void cancel();
+    void finish(bool save);
 
     Pt mouse(LPARAM) const;
     double snap(double v) const;

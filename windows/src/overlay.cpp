@@ -91,9 +91,11 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
         cancel();
         return 0;
     case WM_KEYDOWN: {
-        bool shift = GetKeyState(VK_SHIFT) & 0x8000;
+        bool shift = GetKeyState(VK_SHIFT) & 0x8000, ctrl = GetKeyState(VK_CONTROL) & 0x8000;
+        if (ctrl && (wp == 'C' || wp == 'S')) finish(wp == 'S');
         switch (wp) {
         case VK_ESCAPE: cancel(); break;
+        case VK_RETURN: finish(false); break;
         case VK_LEFT: nudge(-1, 0, shift); break;
         case VK_RIGHT: nudge(1, 0, shift); break;
         case VK_UP: nudge(0, -1, shift); break;
@@ -128,6 +130,11 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void Overlay::cancel() { onDone(nullptr, false); }
+
+void Overlay::finish(bool save) {
+    commitText();
+    if (auto out = render()) onDone(out, save);
+}
 
 Pt Overlay::mouse(LPARAM lp) const { return {GET_X_LPARAM(lp) / k, GET_Y_LPARAM(lp) / k}; }
 
@@ -449,6 +456,25 @@ void Overlay::draw() {
     t->DrawTextLayout(dx(at), l.Get(), white.Get());
 
     if (!barHidden) drawBar();
+}
+
+ComPtr<IWICBitmap> Overlay::render() {
+    if (!sel) return nullptr;
+    const Rect s = *sel;
+    ComPtr<IWICBitmap> out;
+    if (FAILED(wic->CreateBitmap(UINT(std::lround(s.w * k)), UINT(std::lround(s.h * k)), GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &out)))
+        return nullptr;
+    float dpi = float(96 * k);
+    auto props = D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                                              D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+    ComPtr<ID2D1RenderTarget> t;
+    ComPtr<ID2D1Bitmap> src;
+    if (FAILED(d2d->CreateWicBitmapRenderTarget(out.Get(), props, &t)) || FAILED(t->CreateBitmapFromWicBitmap(image.Get(), &src))) return nullptr;
+    t->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    t->BeginDraw();
+    t->SetTransform(D2D1::Matrix3x2F::Translation(float(-s.x), float(-s.y)));
+    t->DrawBitmap(src.Get(), dx(bounds), 1, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    return SUCCEEDED(t->EndDraw()) ? out : nullptr;
 }
 
 void Overlay::drawBar() {

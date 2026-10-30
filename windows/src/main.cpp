@@ -3,6 +3,10 @@
 #include <windowsx.h>
 #include <objbase.h>
 #include <shellscalingapi.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <shobjidl.h>
+#include <mmsystem.h>
 #include <cstdint>
 #include <cwchar>
 #include <vector>
@@ -106,12 +110,130 @@ static void capture() {
     SetFocus(focus);
 }
 
+static bool encodePng(IWICBitmap* image, IStream* stream) {
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    UINT w, h;
+    image->GetSize(&w, &h);
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    return SUCCEEDED(wic->CreateEncoder(GUID_ContainerFormatPng, NULL, &encoder))
+        && SUCCEEDED(encoder->Initialize(stream, WICBitmapEncoderNoCache))
+        && SUCCEEDED(encoder->CreateNewFrame(&frame, NULL))
+        && SUCCEEDED(frame->Initialize(NULL))
+        && SUCCEEDED(frame->SetSize(w, h))
+        && SUCCEEDED(frame->SetPixelFormat(&format))
+        && SUCCEEDED(frame->WriteSource(image, NULL))
+        && SUCCEEDED(frame->Commit())
+        && SUCCEEDED(encoder->Commit());
+}
+
+/// The image as PNG bytes in a moveable global block, exact size: the stream's own block can be larger.
+static HGLOBAL pngGlobal(IWICBitmap* image) {
+    ComPtr<IStream> stream;
+    HGLOBAL source;
+    STATSTG stat;
+    if (FAILED(CreateStreamOnHGlobal(NULL, TRUE, &stream)) || !encodePng(image, stream.Get())
+        || FAILED(GetHGlobalFromStream(stream.Get(), &source)) || FAILED(stream->Stat(&stat, STATFLAG_NONAME)))
+        return NULL;
+    SIZE_T size = SIZE_T(stat.cbSize.QuadPart);
+    HGLOBAL out = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!out) return NULL;
+    memcpy(GlobalLock(out), GlobalLock(source), size);
+    GlobalUnlock(source);
+    GlobalUnlock(out);
+    return out;
+}
+
+/// CF_DIB: 32 bpp, bottom-up rows.
+static HGLOBAL dibGlobal(IWICBitmap* image) {
+    UINT w, h, stride, size;
+    image->GetSize(&w, &h);
+    WICRect all = {0, 0, INT(w), INT(h)};
+    ComPtr<IWICBitmapLock> lock;
+    BYTE* src;
+    if (FAILED(image->Lock(&all, WICBitmapLockRead, &lock)) || FAILED(lock->GetStride(&stride)) || FAILED(lock->GetDataPointer(&size, &src))) return NULL;
+    HGLOBAL out = GlobalAlloc(GMEM_MOVEABLE, sizeof(BITMAPINFOHEADER) + SIZE_T(w) * 4 * h);
+    if (!out) return NULL;
+    auto header = static_cast<BITMAPINFOHEADER*>(GlobalLock(out));
+    *header = {sizeof(BITMAPINFOHEADER), LONG(w), LONG(h), 1, 32, BI_RGB, w * 4 * h};
+    BYTE* dst = reinterpret_cast<BYTE*>(header + 1);
+    for (UINT y = 0; y < h; y++) memcpy(dst + (h - 1 - y) * w * 4, src + y * stride, w * 4);
+    GlobalUnlock(out);
+    return out;
+}
+
+static bool copyImage(IWICBitmap* image) {
+    HGLOBAL png = pngGlobal(image), dib = dibGlobal(image);
+    bool open = false;
+    // Another app can hold the clipboard for a moment.
+    for (int i = 0; i < 10 && !(open = OpenClipboard(app)); i++) Sleep(20);
+    if (!open || !png || !dib) {
+        if (open) CloseClipboard();
+        if (png) GlobalFree(png);
+        if (dib) GlobalFree(dib);
+        return false;
+    }
+    EmptyClipboard();
+    SetClipboardData(RegisterClipboardFormatW(L"PNG"), png);
+    SetClipboardData(CF_DIB, dib);
+    CloseClipboard();
+    return true;
+}
+
+/// Where Win+PrtScn saves, else the Desktop.
+static ComPtr<IShellItem> saveFolder() {
+    ComPtr<IShellItem> item;
+    for (auto id : {FOLDERID_Screenshots, FOLDERID_Desktop}) {
+        PWSTR path = NULL;
+        bool found = SUCCEEDED(SHGetKnownFolderPath(id, 0, NULL, &path)) && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES
+            && SUCCEEDED(SHCreateItemFromParsingName(path, NULL, IID_PPV_ARGS(&item)));
+        CoTaskMemFree(path);
+        if (found) break;
+    }
+    return item;
+}
+
+static void saveImage(IWICBitmap* image) {
+    ComPtr<IFileSaveDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return alert(L"justcap cannot open the save dialog.");
+    COMDLG_FILTERSPEC types[] = {{L"PNG image", L"*.png"}};
+    dialog->SetFileTypes(1, types);
+    dialog->SetDefaultExtension(L"png");
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t name[64];
+    swprintf(name, 64, L"Screenshot %04d-%02d-%02d %02d.%02d.%02d.png", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    dialog->SetFileName(name);
+    if (auto folder = saveFolder()) dialog->SetFolder(folder.Get());
+    modal = true;
+    HRESULT shown = dialog->Show(NULL);
+    modal = false;
+    ComPtr<IShellItem> item;
+    PWSTR path = NULL;
+    if (FAILED(shown) || FAILED(dialog->GetResult(&item)) || FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) return;
+    ComPtr<IStream> stream;
+    bool ok = SUCCEEDED(SHCreateStreamOnFileEx(path, STGM_CREATE | STGM_WRITE, FILE_ATTRIBUTE_NORMAL, TRUE, NULL, &stream)) && encodePng(image, stream.Get());
+    CoTaskMemFree(path);
+    if (!ok) alert(L"justcap cannot save the file.");
+}
+
 static void finish() {
     // Release the windows: they hold the full-screen images.
     for (Overlay* o : windows) delete o;
     windows.clear();
     ComPtr<IWICBitmap> image = result;
     result = nullptr;
+    if (image) {
+        if (resultSave) {
+            saveImage(image.Get());
+        } else if (copyImage(image.Get())) {
+            PlaySoundW(L"SystemAsterisk", NULL, SND_ALIAS | SND_ASYNC);
+        } else {
+            alert(L"justcap cannot copy the image to the clipboard.");
+        }
+        image = nullptr;
+    }
+    // After the save dialog: it needs the foreground first.
     if (previous) SetForegroundWindow(previous);
     previous = NULL;
     SetProcessWorkingSetSize(GetCurrentProcess(), SIZE_T(-1), SIZE_T(-1));  // Graphics drivers stay loaded: back to the idle footprint.
