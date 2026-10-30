@@ -56,7 +56,12 @@ final class OverlayWindow: NSWindow {
     let image: CGImage
     var sel: NSRect? { didSet { for s in [oldValue, sel].compactMap({ $0 }) { setNeedsDisplay(chrome(s)) } } }
     // Annotations are clipped to the selection.
-    var annotations: [Annotation] = [] { didSet { if let s = sel { setNeedsDisplay(s) } } }
+    var annotations: [Annotation] = [] {
+        didSet {
+            if let s = sel { setNeedsDisplay(s) }
+            if let i = hoverText, i >= annotations.count { hoverText = nil }
+        }
+    }
     /// Called with the result image (nil = cancel), the save flag and the size in points.
     var onDone: (CGImage?, Bool, NSSize) -> Void = { _, _, _ in }
     /// Called when a new selection starts here, so the other screens can clear theirs.
@@ -64,7 +69,15 @@ final class OverlayWindow: NSWindow {
 
     private var current: Annotation?
     private var drag = Drag.none
-    private var tool: Tool? { didSet { syncBar() } }
+    private var tool: Tool? { didSet { syncBar(); hoverText = nil } }
+    /// Text tool: the text under the pointer, shown with a dotted box.
+    private var hoverText: Int? {
+        didSet {
+            for i in [oldValue, hoverText].compactMap({ $0 }) where i < annotations.count {
+                setNeedsDisplay(textRect(annotations[i]).insetBy(dx: -6, dy: -6))
+            }
+        }
+    }
     private var colorIndex = max(0, min(UserDefaults.standard.integer(forKey: "color"), palette.count - 1)) { didSet { syncBar() } }
     private var width = CGFloat(max(1, min(UserDefaults.standard.object(forKey: "width") as? Double ?? 3, 20))) {
         didSet { UserDefaults.standard.set(Double(width), forKey: "width") }
@@ -101,7 +114,10 @@ final class OverlayWindow: NSWindow {
 
     override func mouseMoved(with e: NSEvent) {
         let p = convert(e.locationInWindow, from: nil)
-        guard bar.isHidden || !bar.frame.contains(p) else { return }  // arrow cursor rect
+        let onBar = !bar.isHidden && bar.frame.contains(p)
+        let hover = tool == .text && field == nil && !onBar ? textIndex(at: p) : nil
+        if hover != hoverText { hoverText = hover }
+        guard !onBar else { return }  // arrow cursor rect
         guard let s = sel else { NSCursor.crosshair.set(); return }
         if let h = handleHit(at: p, in: s) {
             if #available(macOS 15, *) {
@@ -111,7 +127,7 @@ final class OverlayWindow: NSWindow {
                 (h.hy == 0 ? NSCursor.resizeLeftRight : h.hx == 0 ? .resizeUpDown : .crosshair).set()
             }
         } else {
-            (tool == nil && s.contains(p) ? NSCursor.openHand : .crosshair).set()
+            (tool == nil && s.contains(p) || hoverText != nil ? NSCursor.openHand : .crosshair).set()
         }
     }
 
@@ -260,6 +276,7 @@ final class OverlayWindow: NSWindow {
         let wasEditing = field != nil
         commitText()
         preview = nil
+        hoverText = nil
         let p = convert(e.locationInWindow, from: nil)
         if let s = sel {
             if let h = handle(at: p, in: s) {
@@ -313,6 +330,8 @@ final class OverlayWindow: NSWindow {
             annotations[i].points[0] = NSPoint(x: max(s.minX, min(o.x + p.x - last.x, s.maxX - size.width)),
                                                y: max(s.minY, min(o.y + p.y - last.y, s.maxY - size.height)))
             drag = .text(index: i, start: start, last: p)
+            hoverText = i
+            NSCursor.closedHand.set()
         case .draw:
             guard var a = current else { break }
             let old = a.points
@@ -437,6 +456,15 @@ final class OverlayWindow: NSWindow {
         addSubview(f)
         window?.makeFirstResponder(f)
         field = f
+        hoverText = nil
+        setNeedsDisplay(f.frame.insetBy(dx: -4, dy: -4))
+    }
+
+    /// The field's frame, as wide as its text.
+    private func fieldBox(_ f: NSTextField) -> NSRect {
+        var r = f.frame
+        r.size.width = max(40, (f.stringValue as NSString).size(withAttributes: [.font: f.font ?? font(width)]).width + 4)
+        return r
     }
 
     private func textRect(_ a: Annotation) -> NSRect {
@@ -450,6 +478,7 @@ final class OverlayWindow: NSWindow {
     private func commitText() {
         guard let f = field else { return }
         field = nil
+        setNeedsDisplay(f.frame.insetBy(dx: -4, dy: -4))
         if !f.stringValue.isEmpty {
             annotations.append(Annotation(tool: .text, color: f.textColor ?? color, width: width,
                                           points: [NSPoint(x: f.frame.minX + 2, y: f.frame.minY)], text: f.stringValue))
@@ -460,6 +489,10 @@ final class OverlayWindow: NSWindow {
         edited = nil
         f.removeFromSuperview()
         window?.makeFirstResponder(self)
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        if let f = field { setNeedsDisplay(f.frame.insetBy(dx: -4, dy: -4)) }  // the dotted box follows the text
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -506,12 +539,28 @@ final class OverlayWindow: NSWindow {
             NSColor.black.setStroke()
             NSBezierPath(rect: r).stroke()
         }
+        if let f = field {
+            dottedBox(fieldBox(f))
+        } else if let i = hoverText, i < annotations.count {
+            dottedBox(textRect(annotations[i]).insetBy(dx: -2, dy: -2))
+        }
 
         let label = " \(Int(s.width * scale)) × \(Int(s.height * scale))   \(Int(width)) pt " as NSString
         let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.white,
                                                     .backgroundColor: NSColor(white: 0, alpha: 0.7)]
         let h = label.size(withAttributes: attrs).height
         label.draw(at: NSPoint(x: s.minX, y: s.maxY + h + 4 > bounds.maxY ? s.maxY - h - 4 : s.maxY + 4), withAttributes: attrs)
+    }
+
+    /// Editor chrome around a text: black and white dashes, visible on any background.
+    private func dottedBox(_ r: NSRect) {
+        let path = NSBezierPath(rect: r.integral.insetBy(dx: 0.5, dy: 0.5))
+        path.lineWidth = 1
+        for (c, phase) in [(NSColor.black, CGFloat(0)), (NSColor.white, 3)] {
+            path.setLineDash([3, 3], count: 2, phase: phase)
+            c.setStroke()
+            path.stroke()
+        }
     }
 
     /// The size of the next line or text, at the pointer. Not part of the output image.
