@@ -2,8 +2,10 @@
 #include <shellapi.h>
 #include <windowsx.h>
 #include <objbase.h>
+#include <shellscalingapi.h>
 #include <cstdint>
 #include <cwchar>
+#include <vector>
 
 #define STR2(x) L#x
 #define STR(x) STR2(x)
@@ -11,7 +13,7 @@
 // Global hotkey: PrtScn (the Lightshot default on Windows). Change it with
 // `reg add HKCU\Software\justcap /v hotkeyVK /t REG_DWORD /d 0x33 /f` and `hotkeyMods`.
 static const UINT defaultVK = VK_SNAPSHOT, defaultMods = 0;
-static const UINT WM_TRAY = WM_APP + 1;
+static const UINT WM_TRAY = WM_APP + 1, WM_FINISH = WM_APP + 2;
 enum { ID_CAPTURE = 1, ID_LOGIN, ID_QUIT };
 enum { TIMER_CAPTURE = 1 };
 
@@ -20,6 +22,10 @@ static HICON trayIcon;
 static UINT taskbarCreated;
 static bool custom;
 static bool modal;  // A save dialog or an alert is open: no capture over it.
+static std::vector<Overlay*> windows;
+static HWND previous;  // Gets the focus back after the overlay.
+static ComPtr<IWICBitmap> result;
+static bool resultSave;
 
 static void alert(const wchar_t* text) {
     modal = true;
@@ -27,9 +33,83 @@ static void alert(const wchar_t* text) {
     modal = false;
 }
 
+static BOOL CALLBACK addMonitor(HMONITOR h, HDC, LPRECT, LPARAM list) {
+    reinterpret_cast<std::vector<HMONITOR>*>(list)->push_back(h);
+    return TRUE;
+}
+
+/// The monitor pixels as a WIC bitmap that owns its memory.
+static ComPtr<IWICBitmap> grab(HDC screen, const RECT& r) {
+    int w = r.right - r.left, h = r.bottom - r.top;
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, w, h);
+    HGDIOBJ old = SelectObject(mem, bitmap);
+    BOOL ok = BitBlt(mem, 0, 0, w, h, screen, r.left, r.top, SRCCOPY | CAPTUREBLT);
+    SelectObject(mem, old);
+    DeleteDC(mem);
+    ComPtr<IWICBitmap> raw, out;
+    ComPtr<IWICFormatConverter> converter;
+    if (ok) wic->CreateBitmapFromHBITMAP(bitmap, NULL, WICBitmapIgnoreAlpha, &raw);
+    DeleteObject(bitmap);
+    if (raw && SUCCEEDED(wic->CreateFormatConverter(&converter))
+        && SUCCEEDED(converter->Initialize(raw.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, NULL, 0, WICBitmapPaletteTypeCustom)))
+        wic->CreateBitmapFromSource(converter.Get(), WICBitmapCacheOnLoad, &out);
+    return out;
+}
+
 static void capture() {
-    if (modal) return;
-    alert(L"capture");
+    if (!windows.empty() || modal) return;
+    gfxInit();
+    std::vector<HMONITOR> monitors;
+    EnumDisplayMonitors(NULL, NULL, addMonitor, reinterpret_cast<LPARAM>(&monitors));
+    std::vector<ComPtr<IWICBitmap>> images;
+    std::vector<RECT> rects;
+    HDC screen = GetDC(NULL);
+    for (HMONITOR h : monitors) {
+        MONITORINFO info = {sizeof info};
+        GetMonitorInfoW(h, &info);
+        rects.push_back(info.rcMonitor);
+        images.push_back(grab(screen, info.rcMonitor));
+    }
+    ReleaseDC(NULL, screen);
+    for (auto& image : images) {
+        if (image) continue;
+        alert(L"justcap cannot capture the screen.");
+        return;
+    }
+
+    HWND foreground = GetForegroundWindow();
+    if (foreground != app) previous = foreground;
+    for (size_t i = 0; i < monitors.size(); i++) {
+        UINT dpiX = 96, dpiY = 96;
+        GetDpiForMonitor(monitors[i], MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+        auto o = new Overlay(images[i], rects[i], dpiX / 96.0);
+        o->onDone = [](ComPtr<IWICBitmap> image, bool save) {
+            result = image;
+            resultSave = save;
+            PostMessageW(app, WM_FINISH, 0, 0);
+        };
+        windows.push_back(o);
+    }
+    POINT cursor;
+    GetCursorPos(&cursor);
+    HMONITOR under = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+    HWND focus = windows[0]->hwnd;
+    for (size_t i = 0; i < monitors.size(); i++)
+        if (monitors[i] == under) focus = windows[i]->hwnd;
+    SetForegroundWindow(focus);
+    SetFocus(focus);
+}
+
+static void finish() {
+    // Release the windows: they hold the full-screen images.
+    for (Overlay* o : windows) delete o;
+    windows.clear();
+    ComPtr<IWICBitmap> image = result;
+    result = nullptr;
+    if (previous) SetForegroundWindow(previous);
+    previous = NULL;
+    SetProcessWorkingSetSize(GetCurrentProcess(), SIZE_T(-1), SIZE_T(-1));  // Graphics drivers stay loaded: back to the idle footprint.
 }
 
 /// The camera glyph as an icon. Text coverage becomes alpha, in the color of the taskbar theme.
@@ -89,6 +169,7 @@ static void showMenu(int x, int y) {
     AppendMenuW(menu, MF_STRING, ID_CAPTURE, custom ? L"Capture" : L"Capture  PrtScn");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit justcap");
+    previous = GetForegroundWindow();
     SetForegroundWindow(app);  // Or the menu does not close on an outside click.
     TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, x, y, 0, app, NULL);
     PostMessageW(app, WM_NULL, 0, 0);
@@ -103,6 +184,9 @@ static LRESULT CALLBACK appProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_HOTKEY:
         capture();
+        return 0;
+    case WM_FINISH:
+        finish();
         return 0;
     case WM_TRAY:
         switch (LOWORD(lp)) {
