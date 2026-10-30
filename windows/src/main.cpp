@@ -345,7 +345,50 @@ static LRESULT CALLBACK appProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-static int selftest() { return 0; }
+static void say(const char* text) {
+    DWORD written;
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), text, DWORD(strlen(text)), &written, NULL);
+}
+
+/// `justcap --selftest`: renders a selection with annotations and checks the output.
+static int selftest() {
+    gfxInit();
+    // Source: 200 x 100 px, left half red, right half blue.
+    std::vector<uint32_t> source(200 * 100);
+    for (size_t i = 0; i < source.size(); i++) source[i] = i % 200 < 100 ? 0xFFFF0000 : 0xFF0000FF;
+    ComPtr<IWICBitmap> image;
+    wic->CreateBitmapFromMemory(200, 100, GUID_WICPixelFormat32bppPBGRA, 800, UINT(source.size() * 4), reinterpret_cast<BYTE*>(source.data()), &image);
+    Overlay view(image, RECT{0, 0, 200, 100}, 2, false);  // scale 2
+    // The y values are mirrored from main.swift: this view has its origin at the top.
+    view.sel = Rect{20, 20, 40, 20};
+    view.annotations = {
+        {Tool::line, {0, 1, 0, 1}, 4, {{36, 25}, {60, 25}}},
+        // One 10 DIP block across the red/blue boundary at x = 50.
+        {Tool::pixelate, {0, 0, 1, 1}, 4, {{45, 28}, {55, 38}}},
+    };
+    ComPtr<IWICBitmap> out = view.render();
+    UINT w = 0, h = 0, stride, size;
+    if (out) out->GetSize(&w, &h);
+    if (w != 80 || h != 40) return say("selftest failed: size\n"), 1;
+    WICRect all = {0, 0, 80, 40};
+    ComPtr<IWICBitmapLock> lock;
+    BYTE* px;
+    out->Lock(&all, WICBitmapLockRead, &lock);
+    lock->GetStride(&stride);
+    lock->GetDataPointer(&size, &px);
+    struct Color { double r, g, b; };
+    auto at = [&](int x, int y) {
+        BYTE* p = px + y * stride + x * 4;
+        return Color{p[2] / 255.0, p[1] / 255.0, p[0] / 255.0};
+    };
+    Color line = at(40, 10), red = at(2, 2), blue = at(78, 2), blocks = at(60, 26);
+    if (!(line.g > 0.8 && line.r < 0.2)) return say("selftest failed: annotation\n"), 1;
+    if (!(red.r > 0.9 && red.b < 0.1)) return say("selftest failed: source image, red half\n"), 1;
+    if (!(blue.b > 0.9 && blue.r < 0.1)) return say("selftest failed: source image, blue half\n"), 1;
+    if (!(blocks.r > 0.2 && blocks.r < 0.8 && blocks.b > 0.2 && blocks.b < 0.8)) return say("selftest failed: pixelate\n"), 1;
+    say("selftest ok\n");
+    return 0;
+}
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);

@@ -7,8 +7,23 @@
 ComPtr<IWICImagingFactory> wic;
 static ComPtr<ID2D1Factory> d2d;
 static ComPtr<IDWriteFactory> dw;
-static ComPtr<IDWriteTextFormat> labelFormat;
+static ComPtr<IDWriteTextFormat> labelFormat, iconFormat;
+static ComPtr<ID2D1StrokeStyle> roundStroke, miterStroke;
 static const wchar_t* windowClass = L"justcap.overlay";
+
+static const struct {
+    const wchar_t* name;
+    D2D1_COLOR_F color;
+} palette[] = {
+    {L"Red", {1, 0.15f, 0.15f, 1}},
+    {L"Orange", {1, 0.55f, 0, 1}},
+    {L"Yellow", {1, 0.9f, 0, 1}},
+    {L"Green", {0.1f, 0.8f, 0.2f, 1}},
+    {L"Blue", {0.1f, 0.5f, 1, 1}},
+    {L"White", {1, 1, 1, 1}},
+    {L"Black", {0, 0, 0, 1}},
+};
+static const int paletteCount = int(sizeof palette / sizeof palette[0]);
 
 void gfxInit() {
     if (d2d) return;
@@ -17,6 +32,13 @@ void gfxInit() {
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dw.GetAddressOf()));
     dw->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 11, L"", &labelFormat);
     labelFormat->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    dw->CreateTextFormat(L"Segoe MDL2 Assets", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16, L"", &iconFormat);
+    iconFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    iconFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    auto stroke = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND);
+    d2d->CreateStrokeStyle(stroke, NULL, 0, &roundStroke);
+    stroke = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_LINE_JOIN_MITER);
+    d2d->CreateStrokeStyle(stroke, NULL, 0, &miterStroke);
     WNDCLASSW wc = {};
     wc.lpfnWndProc = Overlay::proc;
     wc.hInstance = GetModuleHandleW(NULL);
@@ -48,10 +70,28 @@ static Pt extent(IDWriteTextLayout* l) {
     return {m.widthIncludingTrailingWhitespace, m.height};
 }
 
+static ComPtr<ID2D1PathGeometry> path(const std::vector<Pt>& pts, bool filled) {
+    ComPtr<ID2D1PathGeometry> g;
+    ComPtr<ID2D1GeometrySink> sink;
+    d2d->CreatePathGeometry(&g);
+    g->Open(&sink);
+    sink->BeginFigure(dx(pts[0]), filled ? D2D1_FIGURE_BEGIN_FILLED : D2D1_FIGURE_BEGIN_HOLLOW);
+    for (size_t i = 1; i < pts.size(); i++) sink->AddLine(dx(pts[i]));
+    sink->EndFigure(filled ? D2D1_FIGURE_END_CLOSED : D2D1_FIGURE_END_OPEN);
+    sink->Close();
+    return g;
+}
+
+static Rect intersect(const Rect& a, const Rect& b) {
+    double x = std::max(a.x, b.x), y = std::max(a.y, b.y);
+    return {x, y, std::min(a.right(), b.right()) - x, std::min(a.bottom(), b.bottom()) - y};
+}
+
 Overlay::Overlay(ComPtr<IWICBitmap> img, RECT m, double scale, bool window) : image(img), k(scale) {
     int pw = m.right - m.left, ph = m.bottom - m.top;
     bounds = {0, 0, pw / k, ph / k};
     width = std::clamp(double(regGet(L"width", 3)), 1.0, 20.0);
+    colorIndex = std::clamp(int(regGet(L"color", 0)), 0, paletteCount - 1);
     cursor = LoadCursorW(NULL, IDC_CROSS);
     if (!window) return;
     hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, windowClass, L"justcap", WS_POPUP, m.left, m.top, pw, ph,
@@ -93,6 +133,7 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_KEYDOWN: {
         bool shift = GetKeyState(VK_SHIFT) & 0x8000, ctrl = GetKeyState(VK_CONTROL) & 0x8000;
         if (ctrl && (wp == 'C' || wp == 'S')) finish(wp == 'S');
+        if (ctrl && wp == 'Z') undo();
         switch (wp) {
         case VK_ESCAPE: cancel(); break;
         case VK_RETURN: finish(false); break;
@@ -112,7 +153,10 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
         if (GetForegroundWindow() != hwnd) SetForegroundWindow(hwnd);
         SetFocus(hwnd);
         Pt p = mouse(lp);
-        if (!barHidden && barRect.contains(p)) return 0;
+        if (!barHidden && barRect.contains(p)) {
+            if (int i = buttonAt(p); i >= 0) press(i);
+            return 0;
+        }
         SetCapture(hwnd);
         mouseDown(p);
         return 0;
@@ -124,6 +168,16 @@ LRESULT Overlay::handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_CAPTURECHANGED:
         if (drag.kind != Drag::none) mouseUp();
+        return 0;
+    case WM_MOUSEWHEEL: {
+        POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};  // Screen coordinates.
+        ScreenToClient(hwnd, &p);
+        scrollWheel({p.x / k, p.y / k}, GET_WHEEL_DELTA_WPARAM(wp));
+        return 0;
+    }
+    case WM_TIMER:
+        KillTimer(hwnd, wp);
+        setPreview(std::nullopt);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
@@ -169,6 +223,30 @@ void Overlay::setHover(std::optional<int> h) {
 void Overlay::setCursor(LPCWSTR id) {
     cursor = LoadCursorW(NULL, id);
     SetCursor(cursor);
+}
+
+void Overlay::setTool(std::optional<Tool> t) {
+    tool = t;
+    if (!barHidden) invalidate(barRect);
+    setHover(std::nullopt);
+}
+
+void Overlay::setColor(int i) {
+    colorIndex = i;
+    regSet(L"color", i);
+    if (!barHidden) invalidate(barRect);
+}
+
+void Overlay::setWidth(double w) {
+    width = w;
+    regSet(L"width", DWORD(w));
+}
+
+void Overlay::setPreview(std::optional<Pt> p) {
+    auto old = preview;
+    preview = p;
+    for (auto q : {old, preview})
+        if (q) invalidate({q->x - 60, q->y - 60, 120, 120});
 }
 
 void Overlay::mouseMoved(Pt p) {
@@ -222,6 +300,61 @@ void Overlay::hideBar() {
     barHidden = true;
 }
 
+void Overlay::press(int i) {
+    if (i < 7) {
+        commitText();
+        setTool(tool && int(*tool) == i ? std::nullopt : std::optional<Tool>(Tool(i)));
+        return;
+    }
+    switch (i) {
+    case 7: pickColor(); break;
+    case 8: undo(); break;
+    case 9: finish(false); break;
+    case 10: finish(true); break;
+    case 11: cancel(); break;
+    }
+}
+
+void Overlay::pickColor() {
+    int size = GetSystemMetrics(SM_CXMENUCHECK);
+    HMENU menu = CreatePopupMenu();
+    HDC screen = GetDC(hwnd), mem = CreateCompatibleDC(screen);
+    HBITMAP swatches[paletteCount];
+    for (int i = 0; i < paletteCount; i++) {
+        const D2D1_COLOR_F c = palette[i].color;
+        swatches[i] = CreateCompatibleBitmap(screen, size, size);
+        HGDIOBJ oldBitmap = SelectObject(mem, swatches[i]);
+        RECT r = {0, 0, size, size};
+        FillRect(mem, &r, GetSysColorBrush(COLOR_MENU));
+        HBRUSH fill = CreateSolidBrush(RGB(c.r * 255, c.g * 255, c.b * 255));
+        HGDIOBJ oldBrush = SelectObject(mem, fill), oldPen = SelectObject(mem, GetStockObject(NULL_PEN));
+        Ellipse(mem, 1, 1, size, size);
+        SelectObject(mem, oldBrush);
+        SelectObject(mem, oldPen);
+        SelectObject(mem, oldBitmap);
+        DeleteObject(fill);
+        std::wstring label = (i == colorIndex ? L"✓ " : L"") + std::wstring(palette[i].name);
+        AppendMenuW(menu, MF_STRING, i + 1, label.c_str());
+        SetMenuItemBitmaps(menu, i, MF_BYPOSITION, swatches[i], swatches[i]);
+    }
+    DeleteDC(mem);
+    ReleaseDC(hwnd, screen);
+    Rect b = button(7);
+    POINT at = {std::lround(b.x * k), std::lround((b.bottom() + 4) * k)};
+    ClientToScreen(hwnd, &at);
+    int picked = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, at.x, at.y, 0, hwnd, NULL);
+    DestroyMenu(menu);
+    for (HBITMAP swatch : swatches) DeleteObject(swatch);
+    if (picked) setColor(picked - 1);
+}
+
+void Overlay::undo() {
+    commitText();
+    if (annotations.empty()) return;
+    annotations.pop_back();
+    annotationsChanged();
+}
+
 /// Arrow keys move the selection by 1 DIP, with Shift by 10 DIP.
 void Overlay::nudge(double dx, double dy, bool shift) {
     if (!sel) return;
@@ -237,6 +370,7 @@ void Overlay::nudge(double dx, double dy, bool shift) {
 
 void Overlay::mouseDown(Pt p) {
     commitText();
+    setPreview(std::nullopt);
     setHover(std::nullopt);
     if (sel) {
         const Rect s = *sel;
@@ -254,7 +388,7 @@ void Overlay::mouseDown(Pt p) {
             if (tool == Tool::text) {
                 beginText(p);
             } else if (tool) {
-                current = Annotation{*tool, D2D1::ColorF(D2D1::ColorF::Red), width, {p, p}};
+                current = Annotation{*tool, palette[colorIndex].color, width, {p, p}};
                 drag = {};
                 drag.kind = Drag::draw;
             } else {
@@ -324,6 +458,7 @@ void Overlay::mouseUp() {
         Annotation a = *current;
         bool freehand = a.tool == Tool::pen || a.tool == Tool::marker;
         current = std::nullopt;
+        if (a.tool == Tool::pixelate) a.blocks = blocks(box(a));
         if (freehand || a.points[0] != a.points[1]) {
             annotations.push_back(a);
             annotationsChanged();
@@ -338,6 +473,18 @@ void Overlay::mouseUp() {
     }
     drag = {};
     layoutBar();
+}
+
+void Overlay::scrollWheel(Pt p, int delta) {
+    if (!sel) return;
+    scrollAcc += delta;
+    if (std::abs(scrollAcc) < WHEEL_DELTA) return;
+    double d = scrollAcc > 0 ? 1 : -1;
+    scrollAcc = 0;
+    setWidth(std::clamp(width + d, 1.0, 20.0));
+    setPreview(p);
+    SetTimer(hwnd, 1, 800, NULL);
+    invalidate(chrome(*sel));  // the size label shows the width
 }
 
 void Overlay::clearSelection() {
@@ -397,6 +544,8 @@ Rect Overlay::bbox(const std::vector<Pt>& pts) const {
     return {x0, y0, x1 - x0, y1 - y0};
 }
 
+Rect Overlay::box(const Annotation& a) const { return bbox({a.points[0], a.points.back()}); }
+
 void Overlay::createTarget() {
     RECT c;
     GetClientRect(hwnd, &c);
@@ -436,6 +585,9 @@ void Overlay::draw() {
     t->PushAxisAlignedClip(dx(s), D2D1_ANTIALIAS_MODE_ALIASED);
     t->DrawBitmap(bmp.Get(), dx(bounds), 1, nearest);
     t->PopAxisAlignedClip();
+    drawAnnotations(t, s);
+
+    if (preview) drawPreview(*preview);
 
     auto white = brush(t, D2D1::ColorF(D2D1::ColorF::White)), black = brush(t, D2D1::ColorF(D2D1::ColorF::Black));
     t->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);  // Chrome stays sharp at 125 %.
@@ -474,11 +626,114 @@ ComPtr<IWICBitmap> Overlay::render() {
     t->BeginDraw();
     t->SetTransform(D2D1::Matrix3x2F::Translation(float(-s.x), float(-s.y)));
     t->DrawBitmap(src.Get(), dx(bounds), 1, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    drawAnnotations(t.Get(), s);
     return SUCCEEDED(t->EndDraw()) ? out : nullptr;
+}
+
+/// The size of the next line or text, at the pointer. Not part of the output image.
+void Overlay::drawPreview(Pt p) {
+    ID2D1RenderTarget* t = rt.Get();
+    double d = tool == Tool::marker ? width * 5 : width;
+    D2D1_COLOR_F c = palette[colorIndex].color;
+    if (tool == Tool::marker) c.a = 0.4f;
+    float r = float(d / 2);
+    t->FillEllipse(D2D1::Ellipse(dx(p), r, r), brush(t, c).Get());
+    t->DrawEllipse(D2D1::Ellipse(dx(p), r + 1.5f, r + 1.5f), brush(t, D2D1::ColorF(D2D1::ColorF::White)).Get());
+}
+
+void Overlay::drawAnnotations(ID2D1RenderTarget* t, const Rect& clip) {
+    t->PushAxisAlignedClip(dx(clip), D2D1_ANTIALIAS_MODE_ALIASED);
+    for (const Annotation& a : annotations) drawAnnotation(t, a);
+    if (current) drawAnnotation(t, *current);
+    t->PopAxisAlignedClip();
+}
+
+void Overlay::drawAnnotation(ID2D1RenderTarget* t, const Annotation& a) {
+    const Pt a0 = a.points[0], a1 = a.points.back();
+    D2D1_COLOR_F c = a.color;
+    if (a.tool == Tool::marker) c.a = 0.4f;
+    auto b = brush(t, c);
+    float w = float(a.width);
+    switch (a.tool) {
+    case Tool::pen:
+    case Tool::marker:
+        if (a.tool == Tool::marker) w *= 5;
+        // A click without movement: Direct2D draws no caps on a zero-length line.
+        if (a.points.size() == 2 && a0 == a1) t->FillEllipse(D2D1::Ellipse(dx(a0), w / 2, w / 2), b.Get());
+        else t->DrawGeometry(path(a.points, false).Get(), b.Get(), w, roundStroke.Get());
+        break;
+    case Tool::line:
+        t->DrawLine(dx(a0), dx(a1), b.Get(), w, roundStroke.Get());
+        break;
+    case Tool::arrow: {
+        double ang = std::atan2(a1.y - a0.y, a1.x - a0.x), head = std::min(a.width * 4 + 6, std::hypot(a1.x - a0.x, a1.y - a0.y));
+        Pt base = {a1.x - head * std::cos(ang), a1.y - head * std::sin(ang)};
+        double px = -std::sin(ang) * head / 2, py = std::cos(ang) * head / 2;
+        t->DrawLine(dx(a0), dx(base), b.Get(), w, roundStroke.Get());
+        t->FillGeometry(path({a1, {base.x + px, base.y + py}, {base.x - px, base.y - py}}, true).Get(), b.Get());
+        break;
+    }
+    case Tool::rect:
+        t->DrawRectangle(dx(box(a)), b.Get(), w, miterStroke.Get());
+        break;
+    case Tool::text:
+        break;
+    case Tool::pixelate: {
+        ComPtr<IWICBitmap> small = a.blocks ? a.blocks : blocks(box(a));
+        ComPtr<ID2D1Bitmap> bitmap;
+        if (small && SUCCEEDED(t->CreateBitmapFromWicBitmap(small.Get(), &bitmap)))
+            t->DrawBitmap(bitmap.Get(), dx(intersect(box(a), bounds)), 1, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+        break;
+    }
+    }
+}
+
+/// The source image in `r` as 10 DIP blocks, one pixel per block. Reads the source image only, not other annotations.
+ComPtr<IWICBitmap> Overlay::blocks(Rect r) const {
+    r = intersect(r, bounds);
+    const double block = 10;
+    if (r.w < 1 || r.h < 1) return nullptr;
+    UINT w = std::max(1u, UINT(r.w / block)), h = std::max(1u, UINT(r.h / block));
+    INT x0 = std::lround(r.x * k), y0 = std::lround(r.y * k);
+    WICRect px = {x0, y0, std::lround(r.right() * k) - x0, std::lround(r.bottom() * k) - y0};
+    ComPtr<IWICBitmapClipper> clipper;
+    ComPtr<IWICBitmapScaler> scaler;
+    ComPtr<IWICBitmap> out;
+    if (SUCCEEDED(wic->CreateBitmapClipper(&clipper)) && SUCCEEDED(clipper->Initialize(image.Get(), &px))
+        && SUCCEEDED(wic->CreateBitmapScaler(&scaler)) && SUCCEEDED(scaler->Initialize(clipper.Get(), w, h, WICBitmapInterpolationModeFant)))
+        wic->CreateBitmapFromSource(scaler.Get(), WICBitmapCacheOnLoad, &out);
+    return out;
 }
 
 void Overlay::drawBar() {
     ID2D1RenderTarget* t = rt.Get();
-    auto r = D2D1::RoundedRect(dx(barRect), 7, 7);
-    t->FillRoundedRectangle(r, brush(t, D2D1::ColorF(0.25f, 0.25f, 0.25f, 0.95f)).Get());
+    t->FillRoundedRectangle(D2D1::RoundedRect(dx(barRect), 7, 7), brush(t, D2D1::ColorF(0.25f, 0.25f, 0.25f, 0.95f)).Get());
+    if (tool) t->FillRoundedRectangle(D2D1::RoundedRect(dx(button(int(*tool))), 4, 4), brush(t, D2D1::ColorF(1, 1, 1, 0.3f)).Get());
+    auto white = brush(t, D2D1::ColorF(D2D1::ColorF::White));
+    // Segoe MDL2 Assets. Zero: drawn below with primitives.
+    static const wchar_t glyphs[12] = {0xE70F, 0, 0, 0, 0xE7E6, 0xE8D2, 0, 0, 0xE7A7, 0xE8C8, 0xE74E, 0xE711};
+    for (int i = 0; i < 12; i++) {
+        Rect r = button(i);
+        double cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+        if (glyphs[i]) t->DrawTextW(&glyphs[i], 1, iconFormat.Get(), dx(r), white.Get());
+        switch (i) {
+        case 1:
+            t->DrawLine(dx(Pt{cx - 6, cy + 6}), dx(Pt{cx + 6, cy - 6}), white.Get(), 1.5f);
+            break;
+        case 2:
+            t->DrawLine(dx(Pt{cx - 6, cy + 6}), dx(Pt{cx + 3, cy - 3}), white.Get(), 1.5f);
+            t->FillGeometry(path({{cx + 6, cy - 6}, {cx - 1, cy - 4}, {cx + 4, cy + 1}}, true).Get(), white.Get());
+            break;
+        case 3:
+            t->DrawRectangle(dx(Rect{cx - 7, cy - 5, 14, 10}), white.Get(), 1.5f);
+            break;
+        case 6:
+            t->FillRectangle(dx(Rect{cx - 6, cy - 6, 6, 6}), white.Get());
+            t->FillRectangle(dx(Rect{cx, cy, 6, 6}), white.Get());
+            break;
+        case 7:
+            t->FillEllipse(D2D1::Ellipse(dx(Pt{cx, cy}), 6, 6), brush(t, palette[colorIndex].color).Get());
+            break;
+        }
+    }
 }

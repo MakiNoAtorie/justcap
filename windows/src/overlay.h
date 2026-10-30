@@ -90,8 +90,21 @@ private:
     void paint();
     void draw();
     void drawBar();
+    void drawPreview(Pt);
+    void drawAnnotations(ID2D1RenderTarget*, const Rect& clip);
+    void drawAnnotation(ID2D1RenderTarget*, const Annotation&);
     void cancel();
     void finish(bool save);
+    void press(int button);
+    void pickColor();
+    void setColor(int);
+    void setTool(std::optional<Tool>);
+    void setWidth(double);
+    void setPreview(std::optional<Pt>);
+    void undo();
+    void scrollWheel(Pt, int delta);
+    Rect box(const Annotation&) const;
+    ComPtr<IWICBitmap> blocks(Rect) const;
 
     Pt mouse(LPARAM) const;
     double snap(double v) const;
@@ -133,7 +146,10 @@ private:
     std::optional<Tool> tool;
     /// Text tool: the text under the pointer, shown with a dotted box.
     std::optional<int> hoverText;
+    int colorIndex;
     double width;
+    int scrollAcc = 0;
+    std::optional<Pt> preview;
     Rect barRect;
     bool barHidden = true;
     HCURSOR cursor;
