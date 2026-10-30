@@ -89,6 +89,11 @@ static void capture() {
             resultSave = save;
             PostMessageW(app, WM_FINISH, 0, 0);
         };
+        // A new selection on one monitor clears the selection on the others.
+        o->onSelectionStart = [o] {
+            for (Overlay* other : windows)
+                if (other != o) other->clearSelection();
+        };
         windows.push_back(o);
     }
     POINT cursor;
