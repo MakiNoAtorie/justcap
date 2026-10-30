@@ -42,10 +42,10 @@ windows\build.cmd            & rem builds windows\build\justcap.exe and does the
 windows\build.cmd install    & rem also copies the exe to %LOCALAPPDATA%\Programs\justcap and starts it
 ```
 
-justcap has a tray icon. A left click on the icon starts a capture. The right-click menu has Capture, Launch at Login and Quit.
+justcap has a tray icon. A left click on the icon starts a capture. The right-click menu has Capture, Set Hotkey, Launch at Login and Quit.
 The keys are the same as on macOS, with Ctrl in place of ⌘ (Ctrl+C, Ctrl+S, Ctrl+Z).
 
-The default hotkey is PrtScn. To change the hotkey, set a virtual-key code and a modifier mask (`MOD_ALT` 1, `MOD_CONTROL` 2, `MOD_SHIFT` 4, `MOD_WIN` 8), then start justcap again:
+The default hotkey is PrtScn. Set Hotkey in the tray menu changes it: press the new key combination. The registry alternative: set a virtual-key code and a modifier mask (`MOD_ALT` 1, `MOD_CONTROL` 2, `MOD_SHIFT` 4, `MOD_WIN` 8), then start justcap again:
 
 ```bat
 reg add HKCU\Software\justcap /v hotkeyVK /t REG_DWORD /d 0x33 /f

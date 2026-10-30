@@ -15,18 +15,20 @@
 #define STR2(x) L#x
 #define STR(x) STR2(x)
 
-// Global hotkey: PrtScn (the Lightshot default on Windows). Change it with
+// Global hotkey: PrtScn (the Lightshot default on Windows). Change it with Set Hotkey in the tray menu or
 // `reg add HKCU\Software\justcap /v hotkeyVK /t REG_DWORD /d 0x33 /f` and `hotkeyMods`.
 static const UINT defaultVK = VK_SNAPSHOT, defaultMods = 0;
 static const wchar_t* runKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const UINT WM_TRAY = WM_APP + 1, WM_FINISH = WM_APP + 2;
-enum { ID_CAPTURE = 1, ID_LOGIN, ID_QUIT };
+enum { ID_CAPTURE = 1, ID_HOTKEY, ID_LOGIN, ID_QUIT };
 enum { TIMER_CAPTURE = 1 };
 
 static HWND app;
 static HICON trayIcon;
 static UINT taskbarCreated;
 static bool custom;
+static UINT hotkeyVK, hotkeyMods;  // The registered hotkey.
+static HWND hotkeyWnd;
 static bool modal;  // A save dialog or an alert is open: no capture over it.
 static std::vector<Overlay*> windows;
 static HWND previous;  // Gets the focus back after the overlay.
@@ -310,10 +312,88 @@ static void toggleLogin() {
     if (status != ERROR_SUCCESS) alert(L"justcap cannot change the Launch at Login setting.");
 }
 
+static bool applyHotkey(UINT vk, UINT mods) {
+    UnregisterHotKey(app, 1);
+    if (!RegisterHotKey(app, 1, mods | MOD_NOREPEAT, vk)) {
+        RegisterHotKey(app, 1, hotkeyMods | MOD_NOREPEAT, hotkeyVK);
+        return false;
+    }
+    regSet(L"hotkeyVK", vk);
+    regSet(L"hotkeyMods", mods);
+    hotkeyVK = vk;
+    hotkeyMods = mods;
+    custom = vk != defaultVK || mods != defaultMods;
+    return true;
+}
+
+static LRESULT CALLBACK hotkeyProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        NONCLIENTMETRICSW metrics = {sizeof metrics};
+        SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof metrics, &metrics, 0);
+        HFONT font = CreateFontIndirectW(&metrics.lfMessageFont);
+        HGDIOBJ old = SelectObject(dc, font);
+        TEXTMETRICW tm;
+        GetTextMetricsW(dc, &tm);
+        RECT r;
+        GetClientRect(hwnd, &r);
+        r.top = (r.bottom - 2 * tm.tmHeight) / 2;
+        SetBkMode(dc, TRANSPARENT);
+        DrawTextW(dc, L"Press the new hotkey.\nEsc keeps the current one.", -1, &r, DT_CENTER | DT_NOPREFIX);
+        SelectObject(dc, old);
+        DeleteObject(font);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        UINT vk = UINT(wp);
+        if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == VK_LWIN || vk == VK_RWIN) return 0;
+        if (vk == VK_ESCAPE) return DestroyWindow(hwnd), 0;
+        UINT mods = (GetKeyState(VK_MENU) < 0 ? MOD_ALT : 0) | (GetKeyState(VK_CONTROL) < 0 ? MOD_CONTROL : 0)
+            | (GetKeyState(VK_SHIFT) < 0 ? MOD_SHIFT : 0) | (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0 ? MOD_WIN : 0);
+        if (applyHotkey(vk, mods)) DestroyWindow(hwnd);
+        else alert(L"That hotkey is not available. Another app uses it. Try another one.");
+        return 0;  // Alt combinations must not reach the system menu.
+    }
+    case WM_SYSCHAR: return 0;  // No beep for Alt combinations.
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_NCDESTROY: hotkeyWnd = NULL; break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/// A small window that takes the next key combination as the hotkey.
+static void setHotkey() {
+    if (hotkeyWnd) return (void)SetForegroundWindow(hotkeyWnd);
+    HINSTANCE inst = GetModuleHandleW(NULL);
+    static bool registered;
+    if (!registered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = hotkeyProc;
+        wc.hInstance = inst;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = HBRUSH(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"justcap.hotkey";
+        registered = RegisterClassW(&wc) != 0;
+    }
+    double scale = GetDpiForSystem() / 96.0;
+    int w = int(360 * scale), h = int(110 * scale);
+    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+    hotkeyWnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, L"justcap.hotkey", L"justcap", WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, w, h, app, NULL, inst, NULL);
+    if (!hotkeyWnd) return;
+    ShowWindow(hotkeyWnd, SW_SHOW);
+    SetForegroundWindow(hotkeyWnd);
+    SetFocus(hotkeyWnd);
+}
+
 static void showMenu(int x, int y) {
     if (modal) return;
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, ID_CAPTURE, custom ? L"Capture" : L"Capture  PrtScn");
+    AppendMenuW(menu, MF_STRING, ID_HOTKEY, L"Set Hotkey…");
     AppendMenuW(menu, MF_STRING | (loginEnabled() ? MF_CHECKED : 0), ID_LOGIN, L"Launch at Login");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_QUIT, L"Quit justcap");
@@ -351,6 +431,7 @@ static LRESULT CALLBACK appProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         switch (LOWORD(wp)) {
         // Lets the tray menu fade out first, so it is not in the capture.
         case ID_CAPTURE: SetTimer(hwnd, TIMER_CAPTURE, 150, NULL); break;
+        case ID_HOTKEY: setHotkey(); break;
         case ID_LOGIN: toggleLogin(); break;
         case ID_QUIT: DestroyWindow(hwnd); break;
         }
@@ -470,13 +551,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     addTray();
 
     UINT vk = regGet(L"hotkeyVK", defaultVK), mods = regGet(L"hotkeyMods", defaultMods);
+    hotkeyVK = vk;
+    hotkeyMods = mods;
     custom = vk != defaultVK || mods != defaultMods;
     if (!RegisterHotKey(app, 1, mods | MOD_NOREPEAT, vk) || (vk == VK_SNAPSHOT && mods == 0 && snippingOwnsPrintScreen())) {
         alert(L"The justcap hotkey is not available. Another app uses it. On Windows 11 the Snipping Tool uses PrtScn: "
               L"turn off Settings > Accessibility > Keyboard > \"Use the Print screen key to open screen capture\", or set another hotkey:\n\n"
               L"reg add HKCU\\Software\\justcap /v hotkeyVK /t REG_DWORD /d 0x33 /f\n"
               L"reg add HKCU\\Software\\justcap /v hotkeyMods /t REG_DWORD /d 6 /f\n\n"
-              L"(0x33 = the 3 key, 6 = Ctrl+Shift.) Then start justcap again. Capture in the tray menu still works.");
+              L"(0x33 = the 3 key, 6 = Ctrl+Shift.) Then start justcap again, or use Set Hotkey in the tray menu. Capture in the tray menu still works.");
     }
 
     MSG m;
